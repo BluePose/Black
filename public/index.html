@@ -1,0 +1,1753 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>채팅 애플리케이션</title>
+    <!-- 외부 폰트 의존성 제거: 시스템 폰트 사용 -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/vendor/js/marked.min.js"></script>
+    <style>
+        :root {
+            /* ===== 새로운 색상 시스템 (균형잡힌 디자인) ===== */
+            
+            /* 메인 그라데이션 색상 */
+            --primary-start: #667eea;
+            --primary-end: #764ba2;
+            --secondary-start: #ff6b6b;
+            --secondary-end: #ffd93d;
+            --accent-start: #4ecdc4;
+            --accent-end: #44a08d;
+            
+            /* 배경 색상 시스템 - 퓨어 블랙에 가까운 깊은 어둠 */
+            --bg-dark: #000000;
+            --bg-medium: #080808;
+            --bg-light: #0f0f0f;
+            --bg-glass: rgba(255,255,255,0.06);
+            --bg-glass-light: rgba(255,255,255,0.02);
+            
+            /* 메인 배경 그라데이션 - 더 깊은 블랙 */
+            --body-bg: linear-gradient(135deg, var(--bg-dark) 0%, var(--bg-medium) 50%, var(--bg-light) 100%);
+            --chat-bg: var(--bg-glass);
+            
+            /* 테두리 색상 */
+            --border-color: rgba(255,255,255,0.2);
+            --border-glass: rgba(255,255,255,0.15);
+            
+            /* 입력창 색상 */
+            --input-bg: var(--bg-glass);
+            --input-border: var(--border-color);
+            --input-focus: var(--primary-start);
+            
+            /* 텍스트 색상 - 대비 강화 */
+            --text-dark: #ffffff;
+            --text-medium: #f1f5f9;
+            --text-light: #cbd5e1;
+            --text-muted: #94a3b8;
+            --text-bright: #f8fafc;
+            
+            /* 메시지 색상 */
+            --my-message-bg: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            --other-message-bg: rgba(255,255,255,0.12);
+            --system-message-color: var(--text-light);
+            
+            /* 그림자 시스템 */
+            --shadow-soft: 0 8px 32px rgba(0,0,0,0.12);
+            --shadow-medium: 0 16px 64px rgba(0,0,0,0.16);
+            --shadow-strong: 0 24px 96px rgba(0,0,0,0.20);
+            --shadow-glow: 0 0 20px rgba(102,126,234,0.3);
+            
+            /* 시스템 폰트 (완전 자체 구동) */
+            --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Malgun Gothic', '맑은 고딕', 'Apple SD Gothic Neo', 'Noto Sans CJK KR', 'Noto Sans KR', sans-serif;
+            
+            /* ===== 성능 모드 설정 ===== */
+            --performance-mode: normal; /* normal | lite */
+        }
+
+        /* ===== 라이트 모드 CSS 변수 오버라이드 ===== */
+        body[data-performance="lite"] {
+            --body-bg: #0a0a0a;
+            --chat-bg: rgba(255,255,255,0.03);
+            --bg-glass: rgba(255,255,255,0.03);
+            --bg-glass-light: rgba(255,255,255,0.01);
+            --shadow-soft: 0 2px 8px rgba(0,0,0,0.3);
+            --shadow-medium: 0 4px 16px rgba(0,0,0,0.4);
+            --shadow-strong: 0 6px 24px rgba(0,0,0,0.5);
+            --shadow-glow: 0 0 8px rgba(102,126,234,0.2);
+        }
+
+        body {
+            font-family: var(--font-family);
+            background: var(--body-bg);
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: var(--text-dark);
+            overflow: hidden;
+        }
+        
+        /* 일반 모드: 고급 애니메이션 */
+        body[data-performance="normal"] {
+            background-size: 400% 400%;
+            animation: gradientMove 15s ease infinite;
+        }
+        
+        /* 라이트 모드: 애니메이션 없음 */
+        body[data-performance="lite"] {
+            background: var(--body-bg);
+        }
+        
+        @keyframes gradientMove {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        .container-wrapper {
+            width: 100%;
+            max-width: 650px;
+            height: 95vh;
+            max-height: 900px;
+            display: flex;
+            flex-direction: column;
+            
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            box-shadow: var(--shadow-medium);
+            
+            overflow: hidden;
+            position: relative;
+        }
+        
+        /* 일반 모드: 글래스모피즘 효과 */
+        body[data-performance="normal"] .container-wrapper {
+            background: var(--chat-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+        }
+        
+        /* 라이트 모드: 단순 배경 */
+        body[data-performance="lite"] .container-wrapper {
+            background: rgba(15,15,15,0.90);
+        }
+        
+        /* backdrop-filter 미지원 시 폴백 */
+        @supports not (backdrop-filter: blur(20px)) {
+            .container-wrapper {
+                background: rgba(15,15,15,0.90);
+            }
+        }
+
+        /* ===== 성능 토글 버튼 ===== */
+        .performance-toggle {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: var(--text-light);
+            padding: 8px 12px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.85em;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+        
+        body[data-performance="lite"] .performance-toggle {
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: none;
+            -webkit-backdrop-filter: none;
+        }
+        
+        .performance-toggle:hover {
+            background: rgba(255,255,255,0.15);
+            transform: translateY(-2px);
+        }
+        
+        .performance-auto-indicator {
+            position: fixed;
+            top: 60px;
+            right: 20px;
+            z-index: 999;
+            background: rgba(255,107,107,0.2);
+            border: 1px solid rgba(255,107,107,0.3);
+            color: var(--secondary-start);
+            padding: 6px 10px;
+            border-radius: 15px;
+            font-size: 0.75em;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            display: none;
+        }
+        
+                 body[data-performance="lite"][data-auto-lite="true"] .performance-auto-indicator {
+             display: block;
+         }
+         
+         /* ===== 새 메시지 알림 최적화 ===== */
+         
+         /* 일반 모드: 글래스 효과 포함 */
+         body[data-performance="normal"] #new-message-indicator {
+             backdrop-filter: blur(15px) !important;
+             -webkit-backdrop-filter: blur(15px) !important;
+         }
+         
+         /* 라이트 모드: 단순 배경 */
+         body[data-performance="lite"] #new-message-indicator {
+             backdrop-filter: none !important;
+             -webkit-backdrop-filter: none !important;
+             background: linear-gradient(135deg, var(--primary-start), var(--primary-end)) !important;
+         }
+
+        #chat-container, #login-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #login-container {
+            justify-content: center;
+            padding: 40px;
+            box-sizing: border-box;
+        }
+        
+        /* 일반 모드: 글래스 효과 */
+        body[data-performance="normal"] #login-container {
+            background: var(--bg-glass-light);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+        }
+        
+        /* 라이트 모드: 단순 배경 */
+        body[data-performance="lite"] #login-container {
+            background: rgba(255,255,255,0.02);
+        }
+        
+        /* ===== Neural Café 브랜딩 스타일 ===== */
+        .brand-header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 20px 0;
+        }
+        
+        .crystal-logo {
+            margin: 0 auto 20px;
+            width: 80px;
+            height: 80px;
+            position: relative;
+        }
+        
+        .crystal-svg {
+            width: 100%;
+            height: 100%;
+            filter: drop-shadow(0 4px 12px rgba(102,126,234,0.3));
+        }
+        
+        /* 크리스털 애니메이션 */
+        body[data-performance="normal"] .crystal-svg {
+            animation: crystalFloat 4s ease-in-out infinite;
+        }
+        
+        body[data-performance="normal"] .crystal-face {
+            animation: crystalShimmer 3s ease-in-out infinite alternate;
+        }
+        
+        body[data-performance="normal"] .crystal-inner-light {
+            animation: innerGlow 2s ease-in-out infinite alternate;
+        }
+        
+        body[data-performance="normal"] .crystal-highlight {
+            animation: sparkle 1.5s ease-in-out infinite alternate;
+        }
+        
+        /* 저전력 모드: 애니메이션 없음 */
+        body[data-performance="lite"] .crystal-svg {
+            transform: none;
+        }
+        
+        @keyframes crystalFloat {
+            0%, 100% { 
+                transform: translateY(0px) rotate(0deg); 
+            }
+            50% { 
+                transform: translateY(-8px) rotate(180deg); 
+            }
+        }
+        
+        @keyframes crystalShimmer {
+            0% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
+        @keyframes innerGlow {
+            0% { opacity: 0.1; }
+            100% { opacity: 0.3; }
+        }
+        
+        @keyframes sparkle {
+            0% { opacity: 0.4; transform: scale(1); }
+            100% { opacity: 1; transform: scale(1.2); }
+        }
+        
+        .brand-title {
+            font-size: 2.5em;
+            margin: 15px 0 10px 0;
+            color: var(--text-bright);
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end), var(--accent-start));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 0 0 30px rgba(102,126,234,0.3);
+        }
+        
+        /* 그라데이션 텍스트 미지원 브라우저용 폴백 */
+        @supports not (background-clip: text) {
+            .brand-title {
+                color: var(--text-bright);
+                text-shadow: 0 2px 4px rgba(102,126,234,0.4);
+            }
+        }
+        
+        .brand-subtitle {
+            font-size: 0.9em;
+            color: var(--text-light);
+            margin: 0 0 10px 0;
+            opacity: 0.9;
+            line-height: 1.3;
+            max-width: 400px;
+            margin-left: auto;
+            margin-right: auto;
+            
+            /* 감각적인 시스템 폰트 스택 */
+            font-family: 
+                'SF Pro Display', 
+                'Helvetica Neue', 
+                'Segoe UI Variable',
+                'Inter',
+                -apple-system, 
+                BlinkMacSystemFont, 
+                'Segoe UI', 
+                'Roboto',
+                'Noto Sans',
+                sans-serif;
+            font-weight: 400;
+            letter-spacing: 0.3px;
+            
+            /* 더 세련된 느낌을 위한 텍스트 렌더링 */
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            text-rendering: optimizeLegibility;
+        }
+        
+        .login-form {
+            margin-top: 20px;
+        }
+        
+        /* 기존 로그인 h1 스타일 제거하고 위의 브랜딩 스타일 사용 */
+        
+        #login-container input {
+            width: 100%;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            border-radius: 20px;
+            border: 1px solid var(--input-border);
+            font-size: 1em;
+            box-sizing: border-box;
+            color: var(--text-bright);
+            background: var(--input-bg);
+            transition: all 0.3s ease;
+        }
+        
+        /* 일반 모드: 글래스 효과 */
+        body[data-performance="normal"] #login-container input {
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            box-shadow: 
+                inset 0 2px 4px rgba(0,0,0,0.1),
+                0 4px 20px rgba(0,0,0,0.05);
+        }
+        
+        /* 라이트 모드: 단순 그림자 */
+        body[data-performance="lite"] #login-container input {
+            box-shadow: 
+                inset 0 1px 2px rgba(0,0,0,0.2),
+                0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        #login-container input:focus {
+            outline: none;
+            border-color: var(--input-focus);
+            box-shadow: 
+                inset 0 2px 4px rgba(0,0,0,0.1),
+                0 4px 20px rgba(0,0,0,0.05),
+                0 0 0 3px rgba(102,126,234,0.2);
+            transform: translateY(-2px);
+        }
+        
+        #login-container input::placeholder {
+            color: var(--text-muted);
+        }
+        
+        #login-container button {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            color: white;
+            border: none;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: 600;
+            
+            /* 통일된 버튼 스타일 */
+            box-shadow: 
+                0 8px 32px rgba(102,126,234,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.1);
+            
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        #login-container button:hover {
+            transform: translateY(-3px);
+            box-shadow: 
+                0 12px 40px rgba(102,126,234,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        #login-container button:active {
+            transform: translateY(0px);
+        }
+        #error-message {
+            color: var(--secondary-start);
+            text-align: center;
+            margin-top: 20px;
+            font-weight: 500;
+            padding: 12px 16px;
+            border-radius: 12px;
+            background: rgba(255,107,107,0.1);
+            border: 1px solid rgba(255,107,107,0.2);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(255,107,107,0.1);
+            
+            /* 기본적으로 숨김 */
+            display: none;
+        }
+        
+        /* 에러 메시지가 있을 때만 표시 */
+        #error-message:not(:empty) {
+            display: block;
+        }
+        
+        /* 페르소나 설정 컨테이너 - 통일된 디자인 */
+        #persona-container {
+            display: none;
+            flex-direction: column;
+            padding: 40px;
+            box-sizing: border-box;
+            justify-content: center;
+            background: var(--bg-glass-light);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+        }
+        
+        .persona-form {
+            margin-top: 20px;
+        }
+        
+        #persona-container input {
+            width: 100%;
+            padding: 16px 20px;
+            margin-bottom: 24px;
+            border-radius: 20px;
+            border: 1px solid var(--input-border);
+            font-size: 1em;
+            box-sizing: border-box;
+            color: var(--text-bright);
+            
+            /* 통일된 입력창 스타일 */
+            background: var(--input-bg);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            box-shadow: 
+                inset 0 2px 4px rgba(0,0,0,0.1),
+                0 4px 20px rgba(0,0,0,0.05);
+            
+            transition: all 0.3s ease;
+        }
+        
+        #persona-container input:focus {
+            outline: none;
+            border-color: var(--input-focus);
+            box-shadow: 
+                inset 0 2px 4px rgba(0,0,0,0.1),
+                0 4px 20px rgba(0,0,0,0.05),
+                0 0 0 3px rgba(102,126,234,0.2);
+            transform: translateY(-2px);
+        }
+        
+        #persona-container input::placeholder {
+            color: var(--text-muted);
+        }
+        
+        #persona-buttons {
+            display: flex;
+            gap: 16px;
+            width: 100%;
+        }
+        
+        #persona-container button {
+            flex-grow: 1;
+            padding: 16px;
+            font-size: 1em;
+            border-radius: 20px;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            
+            /* 통일된 버튼 스타일 */
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            color: white;
+            box-shadow: 
+                0 8px 32px rgba(102,126,234,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.1);
+            
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        #random-persona-btn, #set-persona-btn {
+            /* 기존 기능 유지하면서 새로운 스타일 적용 */
+        }
+        
+        #random-persona-btn:hover, #set-persona-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 
+                0 12px 40px rgba(102,126,234,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        #persona-container button:active {
+            transform: translateY(0px);
+        }
+
+        #chat-container {
+            background-color: var(--chat-bg);
+            overflow: hidden;
+        }
+        
+        #chat-header {
+            padding: 20px;
+            background: linear-gradient(135deg, var(--bg-glass) 0%, var(--bg-glass-light) 100%);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            border-bottom: 1px solid var(--border-color);
+            text-align: center;
+            font-weight: 600;
+            font-size: 1.2em;
+            color: var(--text-dark);
+            flex-shrink: 0;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            position: relative;
+        }
+        
+        #chat-header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 60px;
+            height: 4px;
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            border-radius: 0 0 8px 8px;
+        }
+
+        #messages {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            
+            /* 새로운 배경 디자인 */
+            background: linear-gradient(180deg, var(--bg-glass-light) 0%, var(--bg-glass) 100%);
+            position: relative;
+        }
+        
+        /* 메시지 영역에 미묘한 패턴 추가 */
+        #messages::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-image: 
+                radial-gradient(circle at 25% 25%, rgba(255,255,255,0.02) 1px, transparent 1px),
+                radial-gradient(circle at 75% 75%, rgba(255,255,255,0.02) 1px, transparent 1px);
+            background-size: 24px 24px;
+            pointer-events: none;
+            opacity: 0.6;
+        }
+
+        .message {
+            display: flex;
+            flex-direction: column;
+            max-width: 80%; /* Slightly increased max-width */
+            position: relative;
+        }
+        
+        .message-body {
+            display: flex;
+            align-items: flex-end;
+            gap: 8px;
+        }
+
+        .message-bubble {
+            padding: 12px 18px;
+            border-radius: 18px;
+            line-height: 1.6;
+            position: relative;
+            
+            /* 통일된 뉴모피즘 스타일 */
+            box-shadow: 
+                0 8px 32px rgba(0,0,0,0.15),
+                inset 0 1px 0 rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.1);
+            
+            /* 호버 효과 - 개선된 트랜지션 */
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+        
+        /* 일반 모드: 복잡한 호버 효과 */
+        body[data-performance="normal"] .message-bubble:hover {
+            transform: translateY(-3px) scale(1.01);
+            box-shadow: 
+                0 15px 50px rgba(0,0,0,0.25),
+                0 5px 20px rgba(0,0,0,0.15),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+        }
+        
+        /* 라이트 모드: 단순한 호버 효과 */
+        body[data-performance="lite"] .message-bubble:hover {
+            transform: translateY(-1px);
+            box-shadow: 
+                0 8px 20px rgba(0,0,0,0.2),
+                inset 0 1px 0 rgba(255,255,255,0.1);
+        }
+        
+        .message-from {
+            font-size: 0.85em;
+            font-weight: 600;
+            color: var(--text-bright);
+            margin-bottom: 5px;
+            padding: 0 5px;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+        }
+        
+        .message-content {
+            white-space: pre-wrap; /* Preserve whitespace and newlines */
+            word-wrap: break-word;
+            font-size: 0.9em; /* 약 10% 작게 조정 */
+            line-height: 1.5; /* 가독성을 위한 줄간격 조정 */
+        }
+
+        .message-timestamp {
+            font-size: 0.7em;
+            color: var(--text-light);
+            flex-shrink: 0; /* Prevent timestamp from shrinking */
+        }
+
+        /* My messages */
+        .message.mine {
+            align-self: flex-end;
+            align-items: flex-end;
+        }
+        .message.mine .message-body {
+            flex-direction: row-reverse;
+        }
+        .message.mine .message-bubble {
+            background: var(--my-message-bg);
+            color: white;
+            border-bottom-right-radius: 6px;
+            
+            /* 내 메시지 특별한 글로우 효과 */
+            box-shadow: 
+                0 8px 32px rgba(102,126,234,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+        }
+        .message.mine .message-bubble:hover {
+            box-shadow: 
+                0 12px 40px rgba(102,126,234,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+
+        /* Other user's messages */
+        .message:not(.mine):not(.system) {
+            align-self: flex-start;
+            align-items: flex-start;
+        }
+        .message:not(.mine):not(.system) .message-bubble {
+            background: var(--other-message-bg);
+            color: var(--text-bright);
+            border-bottom-left-radius: 6px;
+        }
+        
+        /* System messages - 가시성 대폭 개선 */
+        .message.system {
+            align-self: center;
+            text-align: center;
+            width: 100%;
+            max-width: 100%;
+        }
+        .message.system .message-content {
+            font-style: italic;
+            color: var(--text-light);
+            font-size: 0.8em; /* 시스템 메시지도 조금 더 작게 */
+            font-weight: 500;
+            padding: 10px 20px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.15);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            text-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        }
+        .message.system .message-from, .message.system .message-timestamp {
+            display: none;
+        }
+
+        /* 회의록 전용 스타일 - 통일된 디자인 */
+        .message.meeting_notes {
+            align-self: center;
+            width: 95%;
+            max-width: 850px;
+            box-sizing: border-box;
+            padding: 8px 0;
+        }
+        .meeting_notes .meeting-minutes-wrapper {
+            /* 회의록용 고대비 디자인 - 종이 텍스처 효과 */
+            background: 
+                linear-gradient(135deg, 
+                    rgba(255,255,255,0.95) 0%, 
+                    rgba(248,250,252,0.98) 100%),
+                radial-gradient(circle at 25% 25%, rgba(255,255,255,0.05) 1px, transparent 1px),
+                radial-gradient(circle at 75% 75%, rgba(240,240,240,0.03) 1px, transparent 1px);
+            background-size: 100% 100%, 20px 20px, 20px 20px;
+            backdrop-filter: blur(30px);
+            -webkit-backdrop-filter: blur(30px);
+            border: 2px solid rgba(255,255,255,0.4);
+            border-radius: 20px;
+            padding: 28px 34px;
+            font-family: var(--font-family);
+            line-height: 1.7; /* 줄간격 조금 줄임 */
+            text-align: left;
+            font-size: 0.9em; /* 회의록 전체 폰트 크기 조정 */
+            
+            /* 회의록용 강화된 그림자와 깊이감 */
+            box-shadow: 
+                0 25px 100px rgba(0,0,0,0.4),
+                0 12px 48px rgba(0,0,0,0.25),
+                inset 0 2px 0 rgba(255,255,255,0.2),
+                inset 0 -1px 0 rgba(0,0,0,0.05);
+                
+            /* 호버 효과 */
+            transition: all 0.3s ease;
+        }
+        
+        .meeting_notes .meeting-minutes-wrapper:hover {
+            transform: translateY(-5px) scale(1.005);
+            box-shadow: 
+                0 35px 140px rgba(0,0,0,0.5),
+                0 18px 70px rgba(0,0,0,0.3),
+                0 5px 30px rgba(102,126,234,0.1),
+                inset 0 3px 0 rgba(255,255,255,0.3),
+                inset 0 -2px 0 rgba(0,0,0,0.08);
+        }
+        .meeting_notes .meeting-minutes-title {
+            font-weight: 800;
+            font-size: 1.15em; /* 제목도 조금 더 작게 */
+            text-align: center;
+            margin-bottom: 24px;
+            color: #0f0f0f;
+            text-shadow: 0 0 1px rgba(0,0,0,0.1);
+        }
+        .meeting_notes h1, .meeting_notes h2, .meeting_notes h3, .meeting_notes h4 {
+            font-family: var(--font-family);
+            font-weight: 800;
+            color: #1a1a1a;
+            margin-top: 1.6em;
+            margin-bottom: 0.9em;
+            padding-bottom: 0.4em;
+            border-bottom: 2px solid rgba(26,26,26,0.15);
+            text-shadow: 0 0 1px rgba(0,0,0,0.1);
+        }
+        .meeting_notes h1 { 
+            font-size: 1.65em; /* h1 크기 줄임 */
+            color: var(--primary-start);
+            font-weight: 900;
+            text-shadow: 0 1px 3px rgba(102,126,234,0.3);
+        }
+        .meeting_notes h2 { 
+            font-size: 1.4em; /* h2 크기 줄임 */
+            color: var(--primary-start);
+            font-weight: 900;
+            text-shadow: 0 1px 3px rgba(102,126,234,0.3);
+        }
+        .meeting_notes h3 { 
+            font-size: 1.1em; /* h3 크기 줄임 */
+        }
+        .meeting_notes ul, .meeting_notes ol {
+            padding-left: 22px;
+            margin-bottom: 1.2em;
+            color: #262626;
+            font-weight: 500;
+        }
+        .meeting_notes li {
+            margin-bottom: 0.7em;
+            color: #262626;
+            font-weight: 500;
+        }
+        .meeting_notes p {
+            margin-bottom: 1.2em;
+            color: #262626;
+            font-weight: 500;
+        }
+        .meeting_notes strong {
+            color: var(--primary-start);
+            font-weight: 700;
+            text-shadow: 0 1px 2px rgba(102,126,234,0.2);
+        }
+
+        #form {
+            display: flex;
+            padding: 20px;
+            border-top: 1px solid var(--border-color);
+            background: var(--bg-glass-light);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+        
+        #input {
+            flex-grow: 1;
+            border: 1px solid var(--input-border);
+            border-radius: 25px;
+            padding: 14px 20px;
+            font-size: 1em;
+            font-family: var(--font-family);
+            color: var(--text-bright);
+            
+            /* 글래스모피즘 입력창 */
+            background: var(--input-bg);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            box-shadow: 
+                inset 0 2px 4px rgba(0,0,0,0.1),
+                0 4px 20px rgba(0,0,0,0.05);
+            
+            transition: all 0.3s ease;
+        }
+        
+        #input:focus {
+            outline: none;
+            border-color: var(--input-focus);
+            box-shadow: 
+                inset 0 2px 4px rgba(0,0,0,0.1),
+                0 8px 30px rgba(0,0,0,0.1),
+                0 0 0 3px rgba(102,126,234,0.25),
+                0 0 20px rgba(102,126,234,0.15);
+            transform: translateY(-3px) scale(1.005);
+        }
+        
+        #input::placeholder {
+            color: var(--text-muted);
+        }
+        
+        #form button {
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            color: white;
+            border: none;
+            border-radius: 25px;
+            padding: 14px 24px;
+            margin-left: 12px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            
+            /* 버튼 효과 */
+            box-shadow: 
+                0 8px 32px rgba(102,126,234,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.1);
+            
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        #form button:hover {
+            transform: translateY(-2px);
+            box-shadow: 
+                0 12px 40px rgba(102,126,234,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        #form button:active {
+            transform: translateY(0px);
+        }
+        
+        /* 향상된 버튼 리플 효과 */
+        #form button::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: radial-gradient(circle, 
+                rgba(255,255,255,0.4) 0%, 
+                rgba(255,255,255,0.1) 70%, 
+                transparent 100%);
+            transform: translate(-50%, -50%);
+            transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+            pointer-events: none;
+        }
+        
+        #form button:active::after {
+            width: 180px;
+            height: 180px;
+            opacity: 0;
+        }
+        
+        /* ===== 현대적인 커스텀 스크롤바 디자인 ===== */
+        
+        /* Webkit 브라우저 (Chrome, Safari, Edge) */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(255,255,255,0.05);
+            border-radius: 10px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.1);
+            
+            /* 호버 효과를 위한 트랜지션 */
+            transition: all 0.3s ease;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(135deg, 
+                color-mix(in srgb, var(--primary-start) 80%, white),
+                color-mix(in srgb, var(--primary-end) 80%, white));
+            box-shadow: 0 2px 8px rgba(102,126,234,0.3);
+        }
+        
+        ::-webkit-scrollbar-thumb:active {
+            background: linear-gradient(135deg, 
+                color-mix(in srgb, var(--primary-start) 90%, black),
+                color-mix(in srgb, var(--primary-end) 90%, black));
+        }
+        
+        ::-webkit-scrollbar-corner {
+            background: rgba(255,255,255,0.05);
+        }
+        
+        /* Firefox 지원 */
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--primary-start) rgba(255,255,255,0.05);
+        }
+        
+        /* 메시지 영역 전용 스크롤바 */
+        #messages::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        #messages::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, 
+                rgba(102,126,234,0.8), 
+                rgba(118,75,162,0.8));
+            border-radius: 6px;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+        
+                 #messages::-webkit-scrollbar-thumb:hover {
+             background: linear-gradient(135deg, 
+                 rgba(102,126,234,0.9), 
+                 rgba(118,75,162,0.9));
+             box-shadow: 0 0 10px rgba(102,126,234,0.4);
+         }
+         
+         /* ===== 마이크로 인터랙션 시스템 (균형모드 - 90%+ 호환) ===== */
+         
+         /* 1. 메시지 등장 애니메이션 */
+         @keyframes messageSlideIn {
+             0% { 
+                 opacity: 0; 
+                 transform: translateY(15px) scale(0.98); 
+             }
+             100% { 
+                 opacity: 1; 
+                 transform: translateY(0) scale(1); 
+             }
+         }
+         
+         @keyframes messageSlideInLite {
+             0% { opacity: 0; }
+             100% { opacity: 1; }
+         }
+         
+         /* 일반 모드: 복잡한 애니메이션 */
+         body[data-performance="normal"] .message {
+             animation: messageSlideIn 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+             animation-fill-mode: both;
+         }
+         
+         body[data-performance="normal"] .moderator-message {
+             animation: messageSlideIn 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+         }
+         
+         body[data-performance="normal"] .meeting_notes {
+             animation: messageSlideIn 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+         }
+         
+         /* 라이트 모드: 단순한 페이드인만 */
+         body[data-performance="lite"] .message,
+         body[data-performance="lite"] .moderator-message,
+         body[data-performance="lite"] .meeting_notes {
+             animation: messageSlideInLite 0.2s ease;
+         }
+          
+          /* 2. 부드러운 스크롤 동작 */
+          html {
+              scroll-behavior: smooth;
+          }
+          
+          #messages {
+              scroll-behavior: smooth;
+          }
+          
+                     /* 3. 컨테이너 호버 효과 미세 조정 */
+           .container-wrapper:hover {
+               transform: translateY(-1px);
+               box-shadow: 
+                   var(--shadow-medium),
+                   0 5px 30px rgba(102,126,234,0.1);
+               transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+           }
+           
+           /* 4. 전역 이징 함수 및 성능 최적화 */
+           .will-animate {
+               will-change: transform, opacity, box-shadow;
+           }
+           
+           .animation-done {
+               will-change: auto;
+           }
+           
+           /* 5. 미세한 펄스 효과 (사회자 배지용) */
+           @keyframes subtlePulse {
+               0%, 100% { opacity: 1; }
+               50% { opacity: 0.85; }
+           }
+           
+           /* 일반 모드: 펄스 애니메이션 */
+           body[data-performance="normal"] .moderator-badge {
+               animation: subtlePulse 3s ease-in-out infinite;
+           }
+           
+           /* 라이트 모드: 애니메이션 없음 */
+           body[data-performance="lite"] .moderator-badge {
+               animation: none;
+           }
+
+        /* 사회자 메시지 스타일 - 전체 디자인과 통일성 */
+        .moderator-message {
+            background: linear-gradient(135deg, var(--primary-start) 0%, var(--primary-end) 100%);
+            border-radius: 20px;
+            margin: 20px 0;
+            padding: 0;
+            max-width: 90%;
+            align-self: center;
+            position: relative;
+            
+            /* 통일된 뉴모피즘 + 글로우 효과 */
+            box-shadow: 
+                0 12px 48px rgba(102,126,234,0.25),
+                0 4px 16px rgba(102,126,234,0.15),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.15);
+            
+            /* 호버 효과 */
+            transition: all 0.3s ease;
+        }
+        
+        .moderator-message:hover {
+            transform: translateY(-3px);
+            box-shadow: 
+                0 16px 56px rgba(102,126,234,0.35),
+                0 6px 20px rgba(102,126,234,0.2),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        .moderator-badge {
+            background: rgba(255, 255, 255, 0.15);
+            color: white !important;
+            font-weight: 600;
+            padding: 12px 16px;
+            border-radius: 20px 20px 0 0;
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            margin-bottom: 0 !important;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            
+            /* 사회자 배지에 미묘한 그라데이션 */
+            background: linear-gradient(135deg, 
+                rgba(255,255,255,0.2) 0%, 
+                rgba(255,255,255,0.1) 100%);
+        }
+        
+        .moderator-bubble {
+            background: rgba(255, 255, 255, 0.95) !important;
+            color: #2d3748 !important;
+            border-radius: 0 0 20px 20px !important;
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            margin: 0;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        
+        .moderator-message .message-content {
+            font-size: 14px; /* 사회자 메시지 원래 크기로 복원 */
+            line-height: 1.6;
+        }
+        
+        .moderator-message .message-content h4 {
+            color: var(--primary-start);
+            margin: 12px 0 6px 0;
+            font-size: 13px; /* 사회자 제목 원래 크기로 복원 */
+            font-weight: 600;
+        }
+        
+        .moderator-message .message-content p {
+            margin: 8px 0;
+        }
+    </style>
+</head>
+<body data-performance="lite" data-auto-lite="false">
+    <!-- 성능 토글 버튼 -->
+    <button class="performance-toggle" id="performance-toggle">
+        🔋 저전력 모드
+    </button>
+    
+    <!-- 자동 라이트 모드 표시 -->
+    <div class="performance-auto-indicator">
+        🔋 자동 저전력 모드
+    </div>
+    
+    <div class="container-wrapper">
+        <div id="login-container">
+            <!-- Neural Café 브랜딩 헤더 -->
+            <div class="brand-header">
+                <!-- 다면체 크리스털 로고 (SVG) -->
+                <div class="crystal-logo">
+                    <svg viewBox="0 0 120 120" class="crystal-svg">
+                        <!-- 외곽 다면체 -->
+                        <defs>
+                            <linearGradient id="crystalGradient1" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+                                <stop offset="50%" style="stop-color:#764ba2;stop-opacity:0.8" />
+                                <stop offset="100%" style="stop-color:#4ecdc4;stop-opacity:0.6" />
+                            </linearGradient>
+                            <linearGradient id="crystalGradient2" x1="100%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#ff6b6b;stop-opacity:0.7" />
+                                <stop offset="50%" style="stop-color:#ffd93d;stop-opacity:0.5" />
+                                <stop offset="100%" style="stop-color:#44a08d;stop-opacity:0.8" />
+                            </linearGradient>
+                            <linearGradient id="crystalGradient3" x1="50%" y1="0%" x2="50%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea;stop-opacity:0.9" />
+                                <stop offset="100%" style="stop-color:#764ba2;stop-opacity:0.4" />
+                            </linearGradient>
+                        </defs>
+                        
+                        <!-- 중앙 다면체 면들 -->
+                        <polygon points="60,15 90,35 75,65 45,65 30,35" fill="url(#crystalGradient1)" class="crystal-face face-1" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="60,15 30,35 60,25 90,35" fill="url(#crystalGradient2)" class="crystal-face face-2" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="30,35 45,65 60,55 60,25" fill="url(#crystalGradient3)" class="crystal-face face-3" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="60,25 60,55 75,65 90,35" fill="url(#crystalGradient1)" class="crystal-face face-4" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="45,65 75,65 60,85 60,55" fill="url(#crystalGradient2)" class="crystal-face face-5" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        
+                        <!-- 내부 반사광 효과 -->
+                        <polygon points="60,25 75,40 60,55 45,40" fill="rgba(255,255,255,0.15)" class="crystal-inner-light"/>
+                        
+                        <!-- 하이라이트 점들 -->
+                        <circle cx="60" cy="25" r="1.5" fill="rgba(255,255,255,0.8)" class="crystal-highlight"/>
+                        <circle cx="45" cy="40" r="1" fill="rgba(255,255,255,0.6)" class="crystal-highlight"/>
+                        <circle cx="75" cy="40" r="1" fill="rgba(255,255,255,0.6)" class="crystal-highlight"/>
+                    </svg>
+                </div>
+                
+                <!-- 브랜드 텍스트 -->
+                <h1 class="brand-title">Neural Café</h1>
+                <p class="brand-subtitle">다양한 AI와 함께 만들어가는 새로운 대화 경험</p>
+            </div>
+            
+            <!-- 로그인 폼 -->
+            <div class="login-form">
+                <input id="username" placeholder="사용자 이름을 입력하세요" />
+                <input id="password" type="password" placeholder="AI 비밀번호 (선택 사항)" />
+                <button id="join-btn">카페 입장하기</button>
+                <p id="error-message"></p>
+            </div>
+        </div>
+
+        <!-- 페르소나 설정 UI (Neural Café 브랜딩 적용) -->
+        <div id="persona-container" style="display: none;">
+            <!-- Neural Café 브랜딩 헤더 (페르소나용) -->
+            <div class="brand-header">
+                <!-- 다면체 크리스털 로고 (동일) -->
+                <div class="crystal-logo">
+                    <svg viewBox="0 0 120 120" class="crystal-svg">
+                        <defs>
+                            <linearGradient id="crystalGradient1-persona" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+                                <stop offset="50%" style="stop-color:#764ba2;stop-opacity:0.8" />
+                                <stop offset="100%" style="stop-color:#4ecdc4;stop-opacity:0.6" />
+                            </linearGradient>
+                            <linearGradient id="crystalGradient2-persona" x1="100%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#ff6b6b;stop-opacity:0.7" />
+                                <stop offset="50%" style="stop-color:#ffd93d;stop-opacity:0.5" />
+                                <stop offset="100%" style="stop-color:#44a08d;stop-opacity:0.8" />
+                            </linearGradient>
+                            <linearGradient id="crystalGradient3-persona" x1="50%" y1="0%" x2="50%" y2="100%">
+                                <stop offset="0%" style="stop-color:#667eea;stop-opacity:0.9" />
+                                <stop offset="100%" style="stop-color:#764ba2;stop-opacity:0.4" />
+                            </linearGradient>
+                        </defs>
+                        
+                        <polygon points="60,15 90,35 75,65 45,65 30,35" fill="url(#crystalGradient1-persona)" class="crystal-face face-1" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="60,15 30,35 60,25 90,35" fill="url(#crystalGradient2-persona)" class="crystal-face face-2" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="30,35 45,65 60,55 60,25" fill="url(#crystalGradient3-persona)" class="crystal-face face-3" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="60,25 60,55 75,65 90,35" fill="url(#crystalGradient1-persona)" class="crystal-face face-4" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        <polygon points="45,65 75,65 60,85 60,55" fill="url(#crystalGradient2-persona)" class="crystal-face face-5" stroke="rgba(255,255,255,0.3)" stroke-width="0.5"/>
+                        
+                        <polygon points="60,25 75,40 60,55 45,40" fill="rgba(255,255,255,0.15)" class="crystal-inner-light"/>
+                        
+                        <circle cx="60" cy="25" r="1.5" fill="rgba(255,255,255,0.8)" class="crystal-highlight"/>
+                        <circle cx="45" cy="40" r="1" fill="rgba(255,255,255,0.6)" class="crystal-highlight"/>
+                        <circle cx="75" cy="40" r="1" fill="rgba(255,255,255,0.6)" class="crystal-highlight"/>
+                    </svg>
+                </div>
+                
+                <h1 class="brand-title">Neural Café</h1>
+                <p class="brand-subtitle">AI 페르소나 설정</p>
+            </div>
+            
+            <div class="persona-form">
+                <input id="persona-input" placeholder="페르소나를 직접 입력하세요">
+                <div id="persona-buttons">
+                    <button id="random-persona-btn">랜덤 선택</button>
+                    <button id="set-persona-btn">카페 입장</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="chat-container">
+            <div id="chat-header">Neural Café - 실시간 AI 대화</div>
+            <div id="messages"></div>
+            <form id="form" action="">
+                <input id="input" autocomplete="off" /><button>전송</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // ===== 성능 관리 시스템 =====
+        class PerformanceManager {
+            constructor() {
+                this.mode = 'lite'; // 'normal' | 'lite' - 기본값을 저전력으로 변경
+                this.autoMode = false;
+                this.init();
+            }
+            
+            init() {
+                // 초기 성능 감지
+                this.detectPerformance();
+                
+                // 토글 버튼 이벤트
+                const toggleBtn = document.getElementById('performance-toggle');
+                toggleBtn.addEventListener('click', () => this.toggleMode());
+                
+                // 로컬 스토리지에서 설정 복원
+                const savedMode = localStorage.getItem('performance-mode');
+                if (savedMode) {
+                    this.setMode(savedMode, false);
+                }
+            }
+            
+            detectPerformance() {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                
+                // GPU 성능 체크
+                let performanceScore = 100;
+                
+                // 1. WebGL 지원 여부
+                if (!gl) performanceScore -= 30;
+                
+                // 2. 하드웨어 동시성 (CPU 코어 수)
+                const cores = navigator.hardwareConcurrency || 1;
+                if (cores < 4) performanceScore -= 20;
+                
+                // 3. 메모리 정보 (Chrome only)
+                if (navigator.deviceMemory && navigator.deviceMemory < 4) {
+                    performanceScore -= 25;
+                }
+                
+                // 4. 연결 속도
+                if (navigator.connection) {
+                    const connection = navigator.connection;
+                    if (connection.effectiveType === 'slow-2g' || connection.effectiveType === '2g') {
+                        performanceScore -= 20;
+                    }
+                    if (connection.saveData) performanceScore -= 15;
+                }
+                
+                // 5. 모바일 기기 감지
+                if (/Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+                    performanceScore -= 15;
+                }
+                
+                // 6. 사파리 (backdrop-filter 성능 이슈)
+                if (/Safari/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent)) {
+                    performanceScore -= 10;
+                }
+                
+                console.log(`성능 점수: ${performanceScore}/100`);
+                
+                // 성능이 높으면 고성능 모드 사용 가능 알림 (기본은 저전력)
+                if (performanceScore >= 80) {
+                    console.log('고성능 환경 감지: 우상단 버튼으로 고성능 모드를 활성화할 수 있습니다.');
+                } else if (performanceScore < 60) {
+                    // 저성능 환경에서는 자동 저전력 모드 표시
+                    this.setMode('lite', true);
+                    console.log('저성능 환경 감지: 안정적인 저전력 모드로 동작합니다.');
+                }
+            }
+            
+            setMode(mode, isAuto = false) {
+                this.mode = mode;
+                this.autoMode = isAuto;
+                
+                // body 데이터 속성 설정
+                document.body.setAttribute('data-performance', mode);
+                document.body.setAttribute('data-auto-lite', isAuto.toString());
+                
+                // 토글 버튼 텍스트 업데이트 (현재 모드 표시)
+                const toggleBtn = document.getElementById('performance-toggle');
+                toggleBtn.textContent = mode === 'normal' ? '⚡ 고성능 모드' : '🔋 저전력 모드';
+                
+                // 로컬 스토리지에 저장 (자동 모드가 아닐 때만)
+                if (!isAuto) {
+                    localStorage.setItem('performance-mode', mode);
+                }
+                
+                this.logModeChange(mode, isAuto);
+            }
+            
+            toggleMode() {
+                const newMode = this.mode === 'normal' ? 'lite' : 'normal';
+                this.setMode(newMode, false);
+            }
+            
+            logModeChange(mode, isAuto) {
+                const modeText = mode === 'normal' ? '고성능' : '저전력';
+                const autoText = isAuto ? ' (자동)' : '';
+                console.log(`🎮 ${modeText} 모드로 전환${autoText}`);
+                
+                if (mode === 'lite') {
+                    console.log('📊 저전력 모드 효과:');
+                    console.log('  - 글래스모피즘 효과 비활성화');
+                    console.log('  - 복잡한 애니메이션 단순화');
+                    console.log('  - 그림자 효과 최소화');
+                    console.log('  - GPU 사용량 감소');
+                }
+            }
+        }
+        
+        // 성능 관리자 초기화
+        const performanceManager = new PerformanceManager();
+        
+        // ===== 스마트 스크롤 관리 시스템 =====
+        class SmartScrollManager {
+            constructor(messagesDiv) {
+                this.messagesDiv = messagesDiv;
+                this.autoScroll = true;  // 자동 스크롤 활성화 여부
+                this.isUserScrolling = false;  // 사용자가 스크롤 중인지
+                this.scrollTimeout = null;
+                this.unreadCount = 0;  // 읽지 않은 메시지 수
+                this.lastScrollPosition = 0;
+                
+                this.init();
+            }
+            
+            init() {
+                // 스크롤 이벤트 리스너 추가
+                this.messagesDiv.addEventListener('scroll', () => this.handleScroll());
+                
+                // 새 메시지 알림 UI 생성
+                this.createNewMessageIndicator();
+            }
+            
+            handleScroll() {
+                const { scrollTop, scrollHeight, clientHeight } = this.messagesDiv;
+                const isAtBottom = Math.abs(scrollHeight - clientHeight - scrollTop) < 5;
+                
+                // 사용자가 스크롤 중임을 표시
+                this.isUserScrolling = true;
+                
+                // 스크롤 완료 감지용 타이머
+                clearTimeout(this.scrollTimeout);
+                this.scrollTimeout = setTimeout(() => {
+                    this.isUserScrolling = false;
+                }, 150);
+                
+                // 맨 아래에 있으면 자동 스크롤 활성화
+                if (isAtBottom) {
+                    this.enableAutoScroll();
+                } else {
+                    // 위로 스크롤했으면 자동 스크롤 비활성화
+                    this.disableAutoScroll();
+                }
+                
+                this.lastScrollPosition = scrollTop;
+            }
+            
+            enableAutoScroll() {
+                if (!this.autoScroll) {
+                    this.autoScroll = true;
+                    this.unreadCount = 0;
+                    this.updateNewMessageIndicator();
+                    console.log('📍 자동 스크롤 활성화');
+                }
+            }
+            
+            disableAutoScroll() {
+                if (this.autoScroll) {
+                    this.autoScroll = false;
+                    console.log('⏸️ 자동 스크롤 비활성화 (과거 메시지 읽기 모드)');
+                }
+            }
+            
+            addNewMessage() {
+                if (this.autoScroll && !this.isUserScrolling) {
+                    // 자동 스크롤이 활성화되어 있으면 바로 스크롤
+                    this.scrollToBottom();
+                } else {
+                    // 자동 스크롤이 비활성화되어 있으면 읽지 않은 메시지 카운트 증가
+                    this.unreadCount++;
+                    this.updateNewMessageIndicator();
+                }
+            }
+            
+            scrollToBottom(smooth = true) {
+                if (smooth) {
+                    this.messagesDiv.scrollTo({
+                        top: this.messagesDiv.scrollHeight,
+                        behavior: 'smooth'
+                    });
+                } else {
+                    this.messagesDiv.scrollTop = this.messagesDiv.scrollHeight;
+                }
+            }
+            
+            createNewMessageIndicator() {
+                const indicator = document.createElement('div');
+                indicator.id = 'new-message-indicator';
+                indicator.style.cssText = `
+                    position: fixed;
+                    bottom: 100px;
+                    right: 30px;
+                    background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+                    color: white;
+                    padding: 10px 16px;
+                    border-radius: 25px;
+                    cursor: pointer;
+                    font-size: 0.85em;
+                    font-weight: 600;
+                    box-shadow: 0 8px 32px rgba(102,126,234,0.4);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    backdrop-filter: blur(15px);
+                    -webkit-backdrop-filter: blur(15px);
+                    z-index: 1000;
+                    transition: all 0.3s ease;
+                    transform: translateY(60px);
+                    opacity: 0;
+                    pointer-events: none;
+                `;
+                
+                indicator.addEventListener('click', () => {
+                    this.enableAutoScroll();
+                    this.scrollToBottom();
+                });
+                
+                document.body.appendChild(indicator);
+                this.indicator = indicator;
+            }
+            
+            updateNewMessageIndicator() {
+                if (!this.indicator) return;
+                
+                if (this.unreadCount > 0 && !this.autoScroll) {
+                    this.indicator.innerHTML = `📩 새 메시지 ${this.unreadCount}개`;
+                    this.indicator.style.transform = 'translateY(0)';
+                    this.indicator.style.opacity = '1';
+                    this.indicator.style.pointerEvents = 'auto';
+                } else {
+                    this.indicator.style.transform = 'translateY(60px)';
+                    this.indicator.style.opacity = '0';
+                    this.indicator.style.pointerEvents = 'none';
+                }
+            }
+        }
+        
+        // ===== 기존 채팅 로직 =====
+        const socket = io();
+        let myUsername = '';
+
+        const messagesDiv = document.getElementById('messages');
+        const form = document.getElementById('form');
+        const input = document.getElementById('input');
+        const loginContainer = document.getElementById('login-container');
+        const chatContainer = document.getElementById('chat-container');
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('password');
+        const joinBtn = document.getElementById('join-btn');
+        const errorMsg = document.getElementById('error-message');
+        const personaContainer = document.getElementById('persona-container');
+        const personaInput = document.getElementById('persona-input');
+        const randomPersonaBtn = document.getElementById('random-persona-btn');
+        const setPersonaBtn = document.getElementById('set-persona-btn');
+        
+        const personaPool = [ '쾌활하고 수다스러운 20대 대학생', '차분하고 논리적인 30대 직장인', '감성적이고 공감 잘하는 40대', '냉정하고 직설적인 성격' ];
+
+        // 스마트 스크롤 관리자 초기화
+        let smartScrollManager = null;
+
+        chatContainer.style.display = 'none';
+        if(personaContainer) personaContainer.style.display = 'none';
+
+        // Event Listeners for Login
+        joinBtn.addEventListener('click', () => {
+            const username = usernameInput.value.trim();
+            if (!username) {
+                errorMsg.textContent = '사용자 이름은 비워둘 수 없습니다.';
+                return;
+            }
+            const password = passwordInput.value;
+            socket.emit('join', { username, password });
+        });
+
+        usernameInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                joinBtn.click();
+            }
+        });
+        passwordInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                joinBtn.click();
+            }
+        });
+
+        randomPersonaBtn.addEventListener('click', () => {
+            personaInput.value = personaPool[Math.floor(Math.random() * personaPool.length)];
+        });
+
+        setPersonaBtn.addEventListener('click', () => {
+            const persona = personaInput.value.trim();
+            
+            if (!persona) {
+                alert('페르소나를 입력하거나 랜덤으로 선택해주세요.');
+                return;
+            }
+
+            socket.emit('set_persona', { persona });
+            
+            personaContainer.style.display = 'none';
+            chatContainer.style.display = 'flex';
+            
+            // AI 사용자도 스마트 스크롤 관리자 초기화
+            if (!smartScrollManager) {
+                smartScrollManager = new SmartScrollManager(messagesDiv);
+            }
+            
+            input.disabled = true;
+            input.placeholder = 'AI는 메시지를 입력할 수 없습니다.';
+            document.querySelector('#form button').disabled = true;
+        });
+
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            if (input.value) {
+                socket.emit('chat_message', input.value);
+                input.value = '';
+            }
+        });
+
+        // Helper Functions
+        function addMessage(msg) {
+            try {
+                const messageEl = document.createElement('div');
+                messageEl.classList.add('message');
+                if (msg.type) messageEl.classList.add(msg.type);
+
+                const isMine = msg.from === myUsername;
+                if (isMine) messageEl.classList.add('mine');
+
+                if (msg.type === 'system') {
+                    const contentEl = document.createElement('div');
+                    contentEl.classList.add('message-content');
+                    contentEl.textContent = msg.content;
+                    messageEl.appendChild(contentEl);
+                } else if (msg.type === 'moderator') {
+                    messageEl.classList.add('moderator-message');
+                    
+                    const fromEl = document.createElement('div');
+                    fromEl.classList.add('message-from', 'moderator-badge');
+                    fromEl.innerHTML = `🎯 ${msg.from} (사회자)`;
+
+                    const bodyWrapper = document.createElement('div');
+                    bodyWrapper.classList.add('message-body');
+
+                    const bubbleEl = document.createElement('div');
+                    bubbleEl.classList.add('message-bubble', 'moderator-bubble');
+
+                    const contentEl = document.createElement('div');
+                    contentEl.classList.add('message-content');
+                    contentEl.innerHTML = marked.parse(msg.content);
+                    
+                    const timestampEl = document.createElement('div');
+                    timestampEl.classList.add('message-timestamp');
+                    timestampEl.textContent = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                    
+                    bubbleEl.appendChild(contentEl);
+                    bodyWrapper.appendChild(bubbleEl);
+                    bodyWrapper.appendChild(timestampEl);
+                    
+                    messageEl.appendChild(fromEl);
+                    messageEl.appendChild(bodyWrapper);
+                } else if (msg.type === 'meeting_notes') {
+                    const parts = msg.content.split('---');
+                    const title = parts[1] || '회의록';
+                    const body = parts[2] || '';
+
+                    messageEl.innerHTML = `
+                        <div class="meeting-minutes-wrapper">
+                            <div class="meeting-minutes-title">${title.trim()}</div>
+                            <div class="meeting-minutes-body">${marked.parse(body.trim())}</div>
+                        </div>
+                    `;
+                } else {
+                    const fromEl = document.createElement('div');
+                    fromEl.classList.add('message-from');
+                    fromEl.textContent = msg.from;
+
+                    const bodyWrapper = document.createElement('div');
+                    bodyWrapper.classList.add('message-body');
+
+                    const bubbleEl = document.createElement('div');
+                    bubbleEl.classList.add('message-bubble');
+
+                    const contentEl = document.createElement('div');
+                    contentEl.classList.add('message-content');
+                    contentEl.textContent = msg.content;
+                    
+                    const timestampEl = document.createElement('div');
+                    timestampEl.classList.add('message-timestamp');
+                    timestampEl.textContent = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                    
+                    bubbleEl.appendChild(contentEl);
+                    bodyWrapper.appendChild(bubbleEl);
+                    bodyWrapper.appendChild(timestampEl);
+                    
+                    messageEl.appendChild(fromEl);
+                    messageEl.appendChild(bodyWrapper);
+                }
+
+                messagesDiv.appendChild(messageEl);
+                
+                // 스마트 스크롤 시스템 사용
+                if (smartScrollManager) {
+                    smartScrollManager.addNewMessage();
+                } else {
+                    // 폴백: 기존 방식
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }
+            } catch (error) {
+                console.error('메시지 렌더링 중 오류 발생:', error, msg);
+            }
+        }
+
+        // Socket Event Listeners
+        socket.on('join_success', ({ username, isAI, users }) => {
+            myUsername = username;
+            
+            if (isAI) {
+                loginContainer.style.display = 'none';
+                personaContainer.style.display = 'flex';
+            } else {
+                loginContainer.style.display = 'none';
+                chatContainer.style.display = 'flex';
+                
+                // 채팅 컨테이너가 표시되면 스마트 스크롤 관리자 초기화
+                if (!smartScrollManager) {
+                    smartScrollManager = new SmartScrollManager(messagesDiv);
+                }
+            }
+            updateUserList(users);
+        });
+
+        socket.on('join_error', (error) => {
+            errorMsg.textContent = error;
+            errorMsg.style.display = 'block';
+        });
+
+        socket.on('userList', (users) => {
+            updateUserList(users);
+        });
+        
+        socket.on('message', (msg) => {
+            addMessage(msg);
+        });
+
+        function updateUserList(users) {
+            // Implementation of updateUserList function
+        }
+    </script>
+</body>
+</html>
