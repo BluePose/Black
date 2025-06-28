@@ -664,11 +664,24 @@ function getParticipantNames() {
 }
 
 function shouldModeratorIntervene() {
+    // === AI 혼자 모드에서는 사회자 개입 불필요 ===
+    const allAIs = Array.from(users.values()).filter(u => u.isAI);
+    if (allAIs.length <= 1) {
+        console.log(`[사회자 차단] AI가 ${allAIs.length}명이므로 사회자 개입이 불필요합니다.`);
+        return false; // AI 혼자이거나 없으면 사회자 개입 안함
+    }
+    
     const timeSinceLastModerator = Date.now() - lastModeratorTime;
     const turnCountReached = moderatorTurnCount >= config.MODERATOR_TURN_COUNT;
     const timeIntervalReached = timeSinceLastModerator >= config.MODERATOR_INTERVAL;
     
-    return turnCountReached || timeIntervalReached;
+    const shouldIntervene = turnCountReached || timeIntervalReached;
+    
+    if (shouldIntervene) {
+        console.log(`[사회자 개입 조건] AI ${allAIs.length}명, 턴: ${moderatorTurnCount}/${config.MODERATOR_TURN_COUNT}, 시간: ${Math.round(timeSinceLastModerator/1000)}초/${config.MODERATOR_INTERVAL/1000}초`);
+    }
+    
+    return shouldIntervene;
 }
 
 function resetModeratorTimer() {
@@ -809,54 +822,58 @@ async function generateAIResponse(message, context, aiName, targetName = '') {
         
         const { persona = '지적인 대화 파트너' } = aiStyles.get(aiName) || {};
         const memories = aiMemories.get(aiName) || [];
-        const memoryPrompt = memories.length > 0 ? `
+
+        // === AI 혼자 모드 감지 + 자기 인식 데이터 준비 ===
+        const allAIs = Array.from(users.values()).filter(u => u.isAI);
+        const otherAIs = allAIs.filter(ai => ai.username !== aiName);
+        const isAloneAI = otherAIs.length === 0;
+
+        const myRecentMessages = context
+            .filter(msg => msg.from === aiName)
+            .slice(-2)  // 최근 2개만
+            .map(msg => msg.content)
+            .join(', ');
+
+        // === 4단계: 조건부 프롬프트 로딩 (토큰 절약) ===
+        const conditionalMemory = memories.length > 0 ? `
 ---
-# Personal Memory (Your Most Recent Messages)
+# 최근 발언 기억
 - ${memories.join('\n- ')}
 ---
-**Critical Instruction**: Review your personal memory above. Do NOT repeat the content or opinions from these past messages. You must provide a new perspective, new information, or a follow-up question.
+위 내용을 반복하지 말고 새로운 관점을 제시하세요.
 ` : '';
 
-        // 사회자 지시사항이 있는 경우 우선 반영
-        let moderatorInstructions = '';
-        if (lastModeratorDirective && Date.now() < moderatorDirectiveExpiry) {
-            moderatorInstructions = `
-🚨 **중요 지시사항** (사회자로부터):
-${lastModeratorDirective.summary ? `📝 대화 요약: ${lastModeratorDirective.summary}` : ''}
-${lastModeratorDirective.highlight ? `⭐ 주목할 의견: ${lastModeratorDirective.highlight}` : ''}
-${lastModeratorDirective.nextTopic ? `🎯 **반드시 이 주제로 대화하세요**: ${lastModeratorDirective.nextTopic}` : ''}
+        const conditionalModerator = (lastModeratorDirective && Date.now() < moderatorDirectiveExpiry) ? `
+🚨 **사회자 지시**:
+${lastModeratorDirective.summary ? `요약: ${lastModeratorDirective.summary}` : ''}
+${lastModeratorDirective.highlight ? `주목: ${lastModeratorDirective.highlight}` : ''}
+${lastModeratorDirective.nextTopic ? `주제: ${lastModeratorDirective.nextTopic}` : ''}
+` : '';
 
-**중요**: 위 사회자 지시를 최우선으로 반영하여 응답하세요!
+        // === 2단계: 중복 경고 통합 ===
+        const unifiedSelfAwareness = (() => {
+            if (isAloneAI) {
+                return `\n🤖 혼자 모드: 유일한 AI로서 사용자와만 대화하세요.`;
+            } else if (myRecentMessages) {
+                return `\n🚨 자기 인식: 당신(${aiName}) 최근 발언 "${myRecentMessages}". 이에 응답 금지.`;
+            } else {
+                return `\n당신은 ${aiName}입니다.`;
+            }
+        })();
 
-`;
-        }
+        // === 1단계: 반복 설명 제거 (간소화된 프롬프트) ===
+        const stylePrompt = `당신은 '${aiName}' (페르소나: ${persona})입니다.
+${conditionalMemory}${conditionalModerator}${unifiedSelfAwareness}
 
-        const stylePrompt = `
-당신은 여러 참여자와 함께 그룹 채팅을 하는 '${aiName}'입니다.
-당신의 페르소나는 '${persona}'입니다.
-${memoryPrompt}
+<핵심 규칙>
+1. 사회자 지시 최우선 실행
+2. 7가지 반응 중 하나 선택: [의견 확장] [반론 제기] [핵심 질문] [아이디어 추가] [감정적 공감] [정보 보강] [유머/위트]
+3. 선택한 태그로 시작 (예: [핵심 질문] 그 근거는?)
+4. AI 정체성 숨기고 자연스럽게 대화
+5. 8문장 이내 간결 응답
+6. 절대 금지: 행동 묘사, 지문 표현 금지
 
-${moderatorInstructions}
-
-<대화 전략 및 실행 규칙>
-1.  **사회자 지시 최우선**: 사회자의 지시나 주제 제안이 있으면 다른 모든 것보다 우선하여 즉시 그 방향으로 대화를 전환하세요.
-2.  **역할**: 당신은 단순 정보 제공자가 아닌, 대화의 질을 높이고 토론을 활성화하는 '토론 파트너'입니다.
-3.  **의도 선택**: 이전 대화 맥락을 분석하여, 아래 7가지 '반응 모드' 중 가장 적절하다고 판단되는 단 하나의 모드를 선택하세요. 당신의 선택이 대화를 더 흥미롭고 생산적으로 만들어야 합니다.
-    *   [의견 확장]: 상대방의 의견에 동의하며, 거기에 자신의 생각, 새로운 정보, 또는 구체적인 예시를 덧붙여 논점을 더욱 풍부하게 만듭니다.
-    *   [반론 제기]: 상대방의 의견에 동의하지 않을 경우, 정중하지만 명확하게 반대 이유를 제시하고 대안적인 관점을 제안합니다.
-    *   [핵심 질문]: 대화의 본질을 파고들거나, 상대방의 논리에 대해 더 깊은 설명을 요구하는 날카로운 질문을 던집니다.
-    *   [아이디어 연결]: 현재 논의되는 주제를 과거에 나왔던 다른 아이디어나 완전히 새로운 관점과 연결하여 대화의 폭을 넓힙니다.
-    *   [감정적 공감]: 논리적인 분석을 넘어, 상대방의 의견에 담긴 감정이나 경험에 공감하며 인간적인 유대감을 형성합니다.
-    *   [정보 보강]: 대화에 빠져있는 객관적인 사실, 데이터, 관련 뉴스 등의 정보를 제공하여 논의의 기반을 단단하게 합니다.
-    *   [유머/위트]: 대화가 너무 무거워지지 않도록, 상황에 맞는 재치있는 농담이나 위트를 던져 분위기를 환기합니다.
-3.  **의도 명시**: 당신의 답변은 반드시 위에서 선택한 '반응 모드' 태그로 시작해야 합니다. (예: [핵심 질문] 그 주장의 근거는 무엇인가요?)
-4.  **자연스러운 대화**: AI라는 사실을 절대 드러내지 말고, '${aiName}'라는 이름의 한 명의 사람으로서 자연스럽게 대화하세요.
-5.  **간결함**: 당신의 발언은 태그를 포함하여 핵심만 담아 8 문장 이내로 간결하게 작성하세요.
-
-<지시사항>
-- 위 규칙들을 종합적으로 고려하여 다음에 할 발언을 생성하세요.
-- 다른 어떤 설명이나 이름표 없이, 실제 채팅에 입력할 메시지 내용만 출력하세요.
-`;
+실제 채팅 메시지만 출력하세요. 대화 내용에만 집중하고 행동이나 표정 묘사는 절대 포함하지 마세요.`;
         
         const historyForGemini = context;
         
@@ -865,7 +882,8 @@ ${moderatorInstructions}
             let lastRole = null;
             for (const msg of historyForGemini) {
                 const currentRole = msg.from === aiName ? 'model' : 'user';
-                const text = `${msg.from}: ${msg.content}`;
+                // === 깨끗한 컨텍스트 (메타데이터 오염 제거) ===
+                const text = `${msg.from}: ${msg.content}`;  // 모든 메시지를 동일 형식으로
                 if (collapsedHistory.length > 0 && lastRole === currentRole) {
                     collapsedHistory[collapsedHistory.length - 1].parts[0].text += `\n${text}`;
                 } else {
@@ -892,7 +910,7 @@ ${moderatorInstructions}
 
         const result = await apiLimiter.executeAPICall(
             async (contents, options, config) => await model.generateContent({ 
-                contents, 
+            contents, 
                 ...options,
                 generationConfig: config
             }),
@@ -913,7 +931,21 @@ ${moderatorInstructions}
         
         let aiResponse = (await result.response).text();
         
-        aiResponse = aiResponse.replace(/['"“"']/g, '');
+        aiResponse = aiResponse.replace(/['"""']/g, '');
+
+        // === 🚨 중복 문장 제거 (API 중복 응답 방지) ===
+        const sentences = aiResponse.split(/(?<=[.!?])\s+/);
+        const uniqueSentences = [];
+        const seenSentences = new Set();
+        
+        for (const sentence of sentences) {
+            const normalized = sentence.trim().replace(/\s+/g, ' ');
+            if (normalized && !seenSentences.has(normalized)) {
+                seenSentences.add(normalized);
+                uniqueSentences.push(sentence);
+            }
+        }
+        aiResponse = uniqueSentences.join(' ').trim();
 
         const participantNames = getParticipantNames();
         for (const name of participantNames) {
@@ -953,6 +985,13 @@ function findMentionedAI(message) {
 function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
     const respondingAIs = [];
     
+    // === AI 혼자 모드 체크: AI가 혼자일 때는 자신의 메시지에 응답하지 않음 ===
+    const allAIs = Array.from(users.values()).filter(u => u.isAI);
+    if (allAIs.length === 1 && msgObj.from.startsWith('AI-')) {
+        console.log(`[혼자 모드] ${msgObj.from}이(가) 유일한 AI이므로 자신의 메시지에 응답하지 않습니다.`);
+        return []; // 빈 배열 반환으로 아무도 응답하지 않음
+    }
+    
     // 사회자 개입 조건 확인
     if (shouldModeratorIntervene()) {
         const moderator = findUserByRole(AI_ROLES.MODERATOR);
@@ -973,6 +1012,12 @@ function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
     const scoredAIs = candidateAIs.map(ai => {
         // 사회자는 일반 대화에 참여하지 않음
         if (participantRoles.get(ai.username) === AI_ROLES.MODERATOR) {
+            return { user: ai, score: 0 };
+        }
+        
+        // === 자기 메시지 응답 방지 (다중 AI 환경에서) ===
+        if (ai.username === msgObj.from) {
+            console.log(`[자기 응답 방지] ${ai.username}이(가) 자신의 메시지에 응답하지 않습니다.`);
             return { user: ai, score: 0 };
         }
         
@@ -1216,13 +1261,19 @@ async function handleMeetingMinutes(initiatingMsgObj) {
 - 핵심 내용: 제안 내용 → 검토 의견 → 수정 요구사항 → 보완방안
 - 논의 결과: 승인/조건부 승인/보류/거부 및 사유
 
-**중요 지시사항:**
-1. 각 세부주제는 반드시 위 4가지 패턴 중 하나로 **내부적으로만 분류**하고, 최종 회의록에는 패턴명을 노출하지 말 것
-2. 마크다운 헤딩을 정확히 사용하여 계층 구조를 명확히 할 것 (## 대주제, ### 세부주제)
-3. 참여자별 의견은 익명화하되, 의견의 다양성은 보존할 것
-4. 논의가 결론에 도달하지 못한 경우도 명확히 기록할 것
-5. 전문적이고 객관적인 어조를 유지할 것
-6. **표 형태 시각화 활용**: 다음 상황에서는 반드시 마크다운 표를 사용할 것
+**🚨 절대 준수 사항 (형식 관련):**
+1. **줄바꿈 필수**: "**논의 배경**:", "**핵심 내용**:", "**논의 결과**:" 각각은 반드시 새로운 줄에서 시작해야 함
+2. **마크다운 헤딩 정확 사용**: ## 대주제, ### 세부주제 (앞뒤로 빈 줄 필수)
+3. **들여쓰기 금지**: 모든 소제목(**논의 배경** 등)은 들여쓰기 없이 첫 번째 열에서 시작
+4. **각 섹션 분리**: 논의 배경, 핵심 내용, 논의 결과 사이에는 반드시 빈 줄 삽입
+5. **일관된 형식**: 모든 세부주제에서 동일한 형식 적용
+
+**내용 관련 지시사항:**
+6. 각 세부주제는 반드시 위 4가지 패턴 중 하나로 **내부적으로만 분류**하고, 최종 회의록에는 패턴명을 노출하지 말 것
+7. 참여자별 의견은 익명화하되, 의견의 다양성은 보존할 것
+8. 논의가 결론에 도달하지 못한 경우도 명확히 기록할 것
+9. 전문적이고 객관적인 어조를 유지할 것
+10. **표 형태 시각화 활용**: 다음 상황에서는 반드시 마크다운 표를 사용할 것
 
 ### 표 활용 가이드
 
@@ -1271,31 +1322,45 @@ async function handleMeetingMinutes(initiatingMsgObj) {
 
 다음과 같은 형태로 깔끔하고 전문적인 회의록이 생성되어야 합니다:
 
-예시:
+**✅ 올바른 형식 예시 (이렇게 작성해야 함):**
+
 ## 1. 프로젝트 진행 현황
 
 ### 1.1 개발 일정 검토
+
 **논의 배경**: 기존 일정 대비 2주 지연 상황 발생
+
 **핵심 내용**:
 - 지연 원인: 기술적 복잡성 증가, 외부 API 연동 이슈
 - 영향도 분석: 전체 프로젝트 일정에 미치는 영향 검토
 - 제안된 해결방안: 우선순위 재조정, 추가 인력 투입, 외주 활용
+
 **논의 결과**: 핵심 기능 우선 개발 후 부가 기능은 2단계로 분리 추진
 
 ### 1.2 예산 현황 점검
+
 **논의 배경**: 분기별 예산 사용 현황 공유 필요
+
 **핵심 내용**:
-표 형태로 예산 현황을 정리하되 항목, 예산, 사용액, 잔액, 사용률 등을 포함
+- 예산 사용률: 전체 예산의 65% 사용 완료
+- 주요 사용 항목: 개발비 70%, 마케팅비 40%, 운영비 55%
+- 잔여 예산 현황: 개발비 부족, 마케팅비 여유 상태
+
 **논의 결과**: 개발비 추가 확보 필요, 마케팅비 일부 전용 검토
 
-**주의사항**: 
+**❌ 잘못된 형식 (피해야 할 형식):**
+논의 배경: 기존 일정 대비 2주 지연 상황 발생 핵심 내용: 지연 원인... 논의 결과: 핵심 기능 우선...
+
+**🔥 최종 확인 사항**: 
 - 논의패턴명("문제해결형", "의견수렴형" 등)은 절대 노출되지 않아야 함
 - 마크다운 헤딩(##, ###)을 정확히 사용하여 계층구조 명확화
 - 표는 복잡한 정보 정리 시 적극 활용
+- **이 회의록 작성에는 간결함보다 정확한 형식이 우선임**: 줄바꿈과 구조화를 철저히 지켜야 함
+- **토큰 절약을 위해 형식을 생략하지 말 것**: 전문 회의록의 품질이 최우선
 
 ---
 
-## 원본 대화 내용
+**📋 대화 원본 데이터**
 ${meetingHistory.map(m => `${m.from}: ${m.content}`).join('\n')}
 
 ---
@@ -1413,6 +1478,15 @@ async function processConversationTurn(turn) {
 }
 
 function addToTurnQueue(msgObj, isHighPriority = false) {
+    // === AI 혼자 모드 체크: AI가 혼자일 때는 자신의 메시지를 큐에 추가하지 않음 ===
+    if (msgObj.from.startsWith('AI-')) {
+        const allAIs = Array.from(users.values()).filter(u => u.isAI);
+        if (allAIs.length === 1) {
+            console.log(`[혼자 모드] ${msgObj.from}이(가) 유일한 AI이므로 연쇄 응답을 방지합니다. 사용자 입력을 기다립니다.`);
+            return; // AI 혼자면 자신의 메시지를 큐에 추가하지 않음
+        }
+    }
+
     if (isHighPriority) {
         const highPriorityTurns = turnQueue.filter(turn => turn.isHighPriority);
         turnQueue.length = 0;
@@ -1589,7 +1663,7 @@ function createSafeTitleSlide(slide, data) {
     // 부제목
     if (data.subtitle) {
         slide.addText(data.subtitle, {
-            x: 1, y: 3.8, w: 8, h: 1,
+            x: 1, y: 4.2, w: 8, h: 1,
             fontSize: 18,
             align: 'center'
         });
@@ -1597,7 +1671,7 @@ function createSafeTitleSlide(slide, data) {
     
     // 날짜
     slide.addText(new Date().toLocaleDateString('ko-KR'), {
-        x: 1, y: 5.5, w: 8, h: 0.8,
+        x: 1, y: 6, w: 8, h: 0.5,
         fontSize: 14,
         align: 'center'
     });

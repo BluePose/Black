@@ -1030,6 +1030,7 @@
 
         #form {
             display: flex;
+            align-items: flex-end; /* 모바일 버튼 찌그러짐 방지 */
             padding: 20px;
             border-top: 1px solid var(--border-color);
             background: var(--bg-glass-light);
@@ -1041,10 +1042,22 @@
             flex-grow: 1;
             border: 1px solid var(--input-border);
             border-radius: 25px;
-            padding: 14px 20px;
+            padding: 10px 20px; /* 상하 패딩 축소 (14px → 10px) */
             font-size: 1em;
             font-family: var(--font-family);
             color: var(--text-bright);
+            
+            /* textarea 최적화 - 높이 축소하여 버튼과 균형 */
+            resize: none;
+            overflow-y: auto;
+            height: auto; /* 자동 높이 */
+            min-height: 48px; /* 버튼보다 작게 시작 */
+            max-height: 120px;
+            line-height: 1.2; /* 행간 축소 */
+            
+            /* 수직 정렬 최적화 */
+            box-sizing: border-box;
+            vertical-align: middle;
             
             /* 글래스모피즘 입력창 */
             background: var(--input-bg);
@@ -1082,6 +1095,12 @@
             cursor: pointer;
             font-size: 1em;
             font-weight: 600;
+            
+            /* 모바일 최적화 */
+            flex-shrink: 0; /* 크기 고정 */
+            min-height: 52px; /* 최소 터치 영역 확보 */
+            height: 52px; /* 고정 높이 */
+            min-width: 80px; /* 최소 너비 보장 */
             
             /* 버튼 효과 */
             box-shadow: 
@@ -1127,6 +1146,51 @@
             width: 180px;
             height: 180px;
             opacity: 0;
+        }
+
+        /* ===== 모바일 최적화 ===== */
+        @media (max-width: 768px) {
+            #form {
+                padding: 15px; /* 모바일에서 패딩 축소 */
+            }
+            
+            #form button {
+                min-height: 48px; /* 모바일 터치 영역 최적화 */
+                height: 48px;
+                min-width: 70px;
+                padding: 12px 20px;
+                margin-left: 10px;
+                font-size: 0.95em;
+            }
+            
+            #input {
+                padding: 8px 18px; /* 모바일 상하 패딩 더 축소 */
+                font-size: 16px; /* iOS 줌 방지 */
+                min-height: 44px; /* 모바일 버튼 높이와 비슷하게 */
+            }
+        }
+        
+        @media (max-width: 480px) {
+            #form {
+                padding: 12px; /* 소형 모바일에서 더 축소 */
+            }
+            
+            #form button {
+                min-width: 60px;
+                padding: 10px 16px;
+                margin-left: 8px;
+                font-size: 0.9em;
+            }
+            
+            #input {
+                padding: 6px 15px; /* 소형 모바일 패딩 최소화 */
+                border-radius: 20px; /* 소형 화면에서 반지름 축소 */
+                min-height: 40px; /* 소형 화면 최적화 */
+            }
+            
+            #form button {
+                border-radius: 20px;
+            }
         }
         
         /* ===== 현대적인 커스텀 스크롤바 디자인 ===== */
@@ -1474,7 +1538,7 @@
             <div id="chat-header">Neural Café - 실시간 AI 대화</div>
             <div id="messages"></div>
             <form id="form" action="">
-                <input id="input" autocomplete="off" /><button>전송</button>
+                <textarea id="input" autocomplete="off" rows="1" placeholder="메시지를 입력하세요... (Shift+Enter: 줄바꿈, Enter: 전송)"></textarea><button>전송</button>
             </form>
         </div>
     </div>
@@ -1844,11 +1908,41 @@
             document.querySelector('#form button').disabled = true;
         });
 
+        // textarea 자동 높이 조절 함수
+        function autoResizeTextarea() {
+            input.style.height = 'auto';
+            const newHeight = Math.min(input.scrollHeight, 120); // 최대 120px
+            input.style.height = newHeight + 'px';
+        }
+
+        // Shift+Enter 줄바꿈, Enter 전송 처리
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                if (e.shiftKey) {
+                    // Shift+Enter: 줄바꿈 허용 (기본 동작)
+                    setTimeout(autoResizeTextarea, 0); // 다음 틱에서 높이 조절
+                    return;
+                } else {
+                    // Enter만: 전송
+                    e.preventDefault();
+                    if (input.value.trim()) {
+                        socket.emit('chat_message', input.value);
+                        input.value = '';
+                        autoResizeTextarea(); // 전송 후 높이 리셋
+                    }
+                }
+            }
+        });
+
+        // input 이벤트로 실시간 높이 조절
+        input.addEventListener('input', autoResizeTextarea);
+
         form.addEventListener('submit', (e) => {
             e.preventDefault();
-            if (input.value) {
+            if (input.value.trim()) {
                 socket.emit('chat_message', input.value);
                 input.value = '';
+                autoResizeTextarea(); // 전송 후 높이 리셋
             }
         });
 
