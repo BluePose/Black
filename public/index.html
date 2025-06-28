@@ -7,6 +7,7 @@
     <!-- 외부 폰트 의존성 제거: 시스템 폰트 사용 -->
     <script src="/socket.io/socket.io.js"></script>
     <script src="/vendor/js/marked.min.js"></script>
+    <script src="/avatars.js"></script>
     <style>
         :root {
             /* ===== 새로운 색상 시스템 (균형잡힌 디자인) ===== */
@@ -201,7 +202,7 @@
              backdrop-filter: none !important;
              -webkit-backdrop-filter: none !important;
              background: linear-gradient(135deg, var(--primary-start), var(--primary-end)) !important;
-         }
+        }
 
         #chat-container, #login-container {
             width: 100%;
@@ -237,8 +238,8 @@
         
         .crystal-logo {
             margin: 0 auto 20px;
-            width: 80px;
-            height: 80px;
+            width: 120px;
+            height: 120px;
             position: relative;
         }
         
@@ -658,6 +659,23 @@
             margin-bottom: 5px;
             padding: 0 5px;
             text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .user-avatar {
+            flex-shrink: 0;
+            border-radius: 50%;
+            overflow: hidden;
+            border: 2px solid rgba(255,255,255,0.2);
+            background: white;
+        }
+        
+        .user-avatar svg {
+            width: 100%;
+            height: 100%;
+            display: block;
         }
         
         .message-content {
@@ -787,6 +805,181 @@
             margin-bottom: 24px;
             color: #0f0f0f;
             text-shadow: 0 0 1px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        
+        /* 생성 버튼 공통 스타일 */
+        .generate-btn {
+            color: white;
+            border: none;
+            border-radius: 20px;
+            padding: 8px 14px;
+            font-size: 0.8em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 1px solid rgba(255,255,255,0.1);
+            white-space: nowrap;
+            margin-left: 8px;
+            min-width: 70px;
+        }
+        
+        .generate-btn:hover {
+            transform: translateY(-2px) scale(1.05);
+        }
+        
+        .generate-btn:active {
+            transform: translateY(0px) scale(1);
+        }
+        
+        .generate-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        /* PPT 생성 버튼 스타일 */
+        .ppt-generate-btn {
+            background: #E74C3C;
+            box-shadow: 
+                0 4px 15px rgba(231,76,60,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+        }
+        
+        .ppt-generate-btn:hover {
+            background: #C0392B;
+            box-shadow: 
+                0 8px 25px rgba(231,76,60,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        /* Word 생성 버튼 스타일 */
+        .word-generate-btn {
+            background: #2E86C1;
+            box-shadow: 
+                0 4px 15px rgba(46,134,193,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+        }
+        
+        .word-generate-btn:hover {
+            background: #2874A6;
+            box-shadow: 
+                0 8px 25px rgba(46,134,193,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        /* PPT 진행 상황 모달 */
+        .ppt-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.8);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+        }
+        
+        .ppt-modal-content {
+            background: linear-gradient(135deg, var(--bg-glass) 0%, var(--bg-glass-light) 100%);
+            backdrop-filter: blur(30px);
+            -webkit-backdrop-filter: blur(30px);
+            border: 2px solid rgba(255,255,255,0.2);
+            border-radius: 20px;
+            padding: 40px;
+            text-align: center;
+            min-width: 400px;
+            max-width: 500px;
+            box-shadow: 
+                0 25px 100px rgba(0,0,0,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+        }
+        
+        .ppt-modal h3 {
+            color: var(--text-bright);
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            font-weight: 700;
+        }
+        
+        .ppt-progress-bar {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            height: 8px;
+            margin: 20px 0;
+            overflow: hidden;
+        }
+        
+        .ppt-progress-fill {
+            background: linear-gradient(90deg, #FF6B6B, #4ECDC4);
+            height: 100%;
+            border-radius: 10px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        
+        .ppt-status-text {
+            color: var(--text-light);
+            margin: 15px 0;
+            font-size: 0.9em;
+        }
+        
+        .ppt-result {
+            background: var(--bg-glass);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        .ppt-download-btn {
+            background: linear-gradient(135deg, var(--primary-start), var(--primary-end));
+            color: white;
+            border: none;
+            border-radius: 25px;
+            padding: 12px 24px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 10px;
+            text-decoration: none;
+            display: inline-block;
+            box-shadow: 
+                0 8px 32px rgba(102,126,234,0.3),
+                inset 0 1px 0 rgba(255,255,255,0.2);
+        }
+        
+        .ppt-download-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 
+                0 12px 40px rgba(102,126,234,0.4),
+                inset 0 1px 0 rgba(255,255,255,0.25);
+        }
+        
+        .ppt-close-btn {
+            background: rgba(255,255,255,0.1);
+            color: var(--text-light);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 25px;
+            padding: 10px 20px;
+            font-size: 0.9em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 10px;
+        }
+        
+        .ppt-close-btn:hover {
+            background: rgba(255,255,255,0.2);
+            transform: translateY(-1px);
         }
         .meeting_notes h1, .meeting_notes h2, .meeting_notes h3, .meeting_notes h4 {
             font-family: var(--font-family);
@@ -1219,10 +1412,10 @@
             
             <!-- 로그인 폼 -->
             <div class="login-form">
-                <input id="username" placeholder="사용자 이름을 입력하세요" />
-                <input id="password" type="password" placeholder="AI 비밀번호 (선택 사항)" />
+            <input id="username" placeholder="사용자 이름을 입력하세요" />
+            <input id="password" type="password" placeholder="AI 비밀번호 (선택 사항)" />
                 <button id="join-btn">카페 입장하기</button>
-                <p id="error-message"></p>
+            <p id="error-message"></p>
             </div>
         </div>
 
@@ -1269,9 +1462,9 @@
             </div>
             
             <div class="persona-form">
-                <input id="persona-input" placeholder="페르소나를 직접 입력하세요">
-                <div id="persona-buttons">
-                    <button id="random-persona-btn">랜덤 선택</button>
+            <input id="persona-input" placeholder="페르소나를 직접 입력하세요">
+            <div id="persona-buttons">
+                <button id="random-persona-btn">랜덤 선택</button>
                     <button id="set-persona-btn">카페 입장</button>
                 </div>
             </div>
@@ -1283,6 +1476,46 @@
             <form id="form" action="">
                 <input id="input" autocomplete="off" /><button>전송</button>
             </form>
+        </div>
+    </div>
+
+    <!-- PPT 생성 진행 상황 모달 -->
+    <div id="ppt-modal" class="ppt-modal">
+        <div class="ppt-modal-content">
+            <h3>프리미엄 PPT 생성중</h3>
+            <div class="ppt-progress-bar">
+                <div id="ppt-progress-fill" class="ppt-progress-fill"></div>
+            </div>
+            <div id="ppt-status-text" class="ppt-status-text">초기화 중...</div>
+            <div id="ppt-result" class="ppt-result" style="display: none;">
+                <h4 style="color: var(--text-bright); margin-bottom: 10px;">PPT 생성 완료!</h4>
+                <p id="ppt-info" style="color: var(--text-light); margin: 10px 0;"></p>
+                <a id="ppt-download-link" class="ppt-download-btn" href="#" download>
+                    💾 PPT 다운로드
+                </a>
+                <button class="ppt-close-btn" onclick="closePptModal()">닫기</button>
+            </div>
+            <div id="ppt-error" style="display: none; color: #FF6B6B; margin: 20px 0;"></div>
+        </div>
+    </div>
+
+    <!-- Word 생성 진행 상황 모달 -->
+    <div id="word-modal" class="ppt-modal">
+        <div class="ppt-modal-content">
+            <h3>Word 문서 생성중</h3>
+            <div class="ppt-progress-bar">
+                <div id="word-progress-fill" class="ppt-progress-fill"></div>
+            </div>
+            <div id="word-status-text" class="ppt-status-text">초기화 중...</div>
+            <div id="word-result" class="ppt-result" style="display: none;">
+                <h4 style="color: var(--text-bright); margin-bottom: 10px;">Word 문서 생성 완료!</h4>
+                <p id="word-info" style="color: var(--text-light); margin: 10px 0;"></p>
+                <a id="word-download-link" class="ppt-download-btn" href="#" download>
+                    💾 Word 다운로드
+                </a>
+                <button class="ppt-close-btn" onclick="closeWordModal()">닫기</button>
+            </div>
+            <div id="word-error" style="display: none; color: #FF6B6B; margin: 20px 0;"></div>
         </div>
     </div>
 
@@ -1639,7 +1872,15 @@
                     
                     const fromEl = document.createElement('div');
                     fromEl.classList.add('message-from', 'moderator-badge');
-                    fromEl.innerHTML = `🎯 ${msg.from} (사회자)`;
+                    
+                    // 사회자 아바타 추가
+                    const avatarEl = createAvatarElement(msg.from, 28);
+                    fromEl.appendChild(avatarEl);
+                    
+                    // 사회자 이름과 뱃지 추가
+                    const nameEl = document.createElement('span');
+                    nameEl.innerHTML = `🎯 ${msg.from} (사회자)`;
+                    fromEl.appendChild(nameEl);
 
                     const bodyWrapper = document.createElement('div');
                     bodyWrapper.classList.add('message-body');
@@ -1668,14 +1909,32 @@
 
                     messageEl.innerHTML = `
                         <div class="meeting-minutes-wrapper">
-                            <div class="meeting-minutes-title">${title.trim()}</div>
+                            <div class="meeting-minutes-title">
+                                ${title.trim()}
+                                <div class="generate-buttons">
+                                    <button class="generate-btn ppt-generate-btn" onclick="generatePPT()">
+                                        📊 PPT
+                                    </button>
+                                    <button class="generate-btn word-generate-btn" onclick="generateWord()">
+                                        📄 Word
+                                    </button>
+                                </div>
+                            </div>
                             <div class="meeting-minutes-body">${marked.parse(body.trim())}</div>
                         </div>
                     `;
                 } else {
                     const fromEl = document.createElement('div');
                     fromEl.classList.add('message-from');
-                    fromEl.textContent = msg.from;
+                    
+                    // 아바타 추가
+                    const avatarEl = createAvatarElement(msg.from, 28);
+                    fromEl.appendChild(avatarEl);
+                    
+                    // 사용자명 추가
+                    const nameEl = document.createElement('span');
+                    nameEl.textContent = msg.from;
+                    fromEl.appendChild(nameEl);
 
                     const bodyWrapper = document.createElement('div');
                     bodyWrapper.classList.add('message-body');
@@ -1706,7 +1965,7 @@
                     smartScrollManager.addNewMessage();
                 } else {
                     // 폴백: 기존 방식
-                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 }
             } catch (error) {
                 console.error('메시지 렌더링 중 오류 발생:', error, msg);
@@ -1743,6 +2002,243 @@
         
         socket.on('message', (msg) => {
             addMessage(msg);
+        });
+
+        // PPT 생성 관련 소켓 이벤트 리스너
+        socket.on('ppt_progress', (data) => {
+            updatePptProgress(data);
+        });
+
+        socket.on('ppt_ready', (data) => {
+            showPptResult(data);
+        });
+
+        socket.on('ppt_error', (data) => {
+            showPptError(data.message);
+        });
+
+        // Word 생성 관련 소켓 이벤트 리스너
+        socket.on('word_progress', (data) => {
+            updateWordProgress(data);
+        });
+
+        socket.on('word_ready', (data) => {
+            showWordResult(data);
+        });
+
+        socket.on('word_error', (data) => {
+            showWordError(data.message);
+        });
+
+        // PPT 생성 관련 함수들
+        function generatePPT() {
+            const pptBtns = document.querySelectorAll('.ppt-generate-btn');
+            pptBtns.forEach(btn => {
+                btn.disabled = true;
+                btn.textContent = '생성 중...';
+            });
+            
+            showPptModal();
+            socket.emit('generate_ppt');
+        }
+
+        // Word 생성 관련 함수들
+        function generateWord() {
+            const wordBtns = document.querySelectorAll('.word-generate-btn');
+            wordBtns.forEach(btn => {
+                btn.disabled = true;
+                btn.textContent = '생성 중...';
+            });
+            
+            showWordModal();
+            socket.emit('generate_word');
+        }
+
+        function showPptModal() {
+            const modal = document.getElementById('ppt-modal');
+            const progressFill = document.getElementById('ppt-progress-fill');
+            const statusText = document.getElementById('ppt-status-text');
+            const result = document.getElementById('ppt-result');
+            const error = document.getElementById('ppt-error');
+            
+            // 모달 초기화
+            progressFill.style.width = '0%';
+            statusText.textContent = '초기화 중...';
+            result.style.display = 'none';
+            error.style.display = 'none';
+            
+            modal.style.display = 'flex';
+        }
+
+        function updatePptProgress(data) {
+            const progressFill = document.getElementById('ppt-progress-fill');
+            const statusText = document.getElementById('ppt-status-text');
+            
+            const progressMap = {
+                'analyzing': { width: '25%', text: data.message },
+                'structuring': { width: '60%', text: data.message },
+                'creating': { width: '90%', text: data.message }
+            };
+            
+            const progress = progressMap[data.stage] || { width: '10%', text: data.message };
+            
+            progressFill.style.width = progress.width;
+            statusText.textContent = progress.text;
+        }
+
+        function showPptResult(data) {
+            const progressFill = document.getElementById('ppt-progress-fill');
+            const statusText = document.getElementById('ppt-status-text');
+            const result = document.getElementById('ppt-result');
+            const pptInfo = document.getElementById('ppt-info');
+            const downloadLink = document.getElementById('ppt-download-link');
+            
+            // 진행률 완료
+            progressFill.style.width = '100%';
+            statusText.textContent = '완료!';
+            
+            // 결과 표시
+            setTimeout(() => {
+                pptInfo.textContent = `${data.title} (${data.slideCount}개 슬라이드)`;
+                downloadLink.href = data.downloadUrl;
+                downloadLink.download = data.fileName;
+                result.style.display = 'block';
+            }, 500);
+            
+            // 버튼 복원
+            restorePptButtons();
+        }
+
+        function showPptError(message) {
+            const error = document.getElementById('ppt-error');
+            const statusText = document.getElementById('ppt-status-text');
+            
+            statusText.textContent = '오류 발생';
+            error.textContent = message;
+            error.style.display = 'block';
+            
+            // 버튼 복원
+            restorePptButtons();
+            
+            // 3초 후 모달 자동 닫기
+            setTimeout(() => {
+                closePptModal();
+            }, 3000);
+        }
+
+        function restorePptButtons() {
+            const pptBtns = document.querySelectorAll('.ppt-generate-btn');
+            pptBtns.forEach(btn => {
+                btn.disabled = false;
+                btn.textContent = '📊 PPT';
+            });
+        }
+
+        function closePptModal() {
+            const modal = document.getElementById('ppt-modal');
+            modal.style.display = 'none';
+            restorePptButtons();
+        }
+
+        // 모달 외부 클릭 시 닫기
+        document.getElementById('ppt-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'ppt-modal') {
+                closePptModal();
+            }
+        });
+
+        // Word 생성 관련 함수들
+        function showWordModal() {
+            const modal = document.getElementById('word-modal');
+            const progressFill = document.getElementById('word-progress-fill');
+            const statusText = document.getElementById('word-status-text');
+            const result = document.getElementById('word-result');
+            const error = document.getElementById('word-error');
+            
+            // 모달 초기화
+            progressFill.style.width = '0%';
+            statusText.textContent = '초기화 중...';
+            result.style.display = 'none';
+            error.style.display = 'none';
+            
+            modal.style.display = 'flex';
+        }
+
+        function updateWordProgress(data) {
+            const progressFill = document.getElementById('word-progress-fill');
+            const statusText = document.getElementById('word-status-text');
+            
+            const progressMap = {
+                'preparing': { width: '30%', text: data.message },
+                'converting': { width: '70%', text: data.message },
+                'saving': { width: '90%', text: data.message }
+            };
+            
+            const progress = progressMap[data.stage] || { width: '10%', text: data.message };
+            
+            progressFill.style.width = progress.width;
+            statusText.textContent = progress.text;
+        }
+
+        function showWordResult(data) {
+            const progressFill = document.getElementById('word-progress-fill');
+            const statusText = document.getElementById('word-status-text');
+            const result = document.getElementById('word-result');
+            const wordInfo = document.getElementById('word-info');
+            const downloadLink = document.getElementById('word-download-link');
+            
+            // 진행률 완료
+            progressFill.style.width = '100%';
+            statusText.textContent = '완료!';
+            
+            // 결과 표시
+            setTimeout(() => {
+                wordInfo.textContent = `${data.title} (${data.pageCount}페이지)`;
+                downloadLink.href = data.downloadUrl;
+                downloadLink.download = data.fileName;
+                result.style.display = 'block';
+            }, 500);
+            
+            // 버튼 복원
+            restoreWordButtons();
+        }
+
+        function showWordError(message) {
+            const error = document.getElementById('word-error');
+            const statusText = document.getElementById('word-status-text');
+            
+            statusText.textContent = '오류 발생';
+            error.textContent = message;
+            error.style.display = 'block';
+            
+            // 버튼 복원
+            restoreWordButtons();
+            
+            // 3초 후 모달 자동 닫기
+            setTimeout(() => {
+                closeWordModal();
+            }, 3000);
+        }
+
+        function restoreWordButtons() {
+            const wordBtns = document.querySelectorAll('.word-generate-btn');
+            wordBtns.forEach(btn => {
+                btn.disabled = false;
+                btn.textContent = '📄 Word';
+            });
+        }
+
+        function closeWordModal() {
+            const modal = document.getElementById('word-modal');
+            modal.style.display = 'none';
+            restoreWordButtons();
+        }
+
+        // Word 모달 외부 클릭 시 닫기
+        document.getElementById('word-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'word-modal') {
+                closeWordModal();
+            }
         });
 
         function updateUserList(users) {

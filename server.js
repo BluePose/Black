@@ -6,6 +6,11 @@ const io = require('socket.io')(http);
 const path = require('path');
 const fs = require('fs');
 const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require('@google/generative-ai');
+const PptxGenJS = require('pptxgenjs');
+const { Document, Packer, Paragraph, HeadingLevel, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType } = require('docx');
+
+// 아바타 시스템 로드
+const { getUserAvatarIndex, getUserAvatar } = require('./public/avatars.js');
 
 // ===================================================================================
 // 설정 (Configuration)
@@ -24,6 +29,9 @@ const config = {
     MODERATOR_TURN_COUNT: 8, // 8턴마다 사회자 개입
     MAX_CONTEXT_LENGTH: 25, // AI의 단기 기억(컨텍스트) 최대 길이
     TARGET_CONTEXT_LENGTH: 15, // 압축 후 목표 컨텍스트 길이
+    // AI API 동시 호출 제한 설정
+    MAX_CONCURRENT_API_CALLS: 3, // 최대 동시 API 호출 수
+    API_CALL_DELAY: 500, // API 호출 간격 (ms)
 };
 
 if (!config.GOOGLE_API_KEY) {
@@ -32,6 +40,404 @@ if (!config.GOOGLE_API_KEY) {
 }
 
 const logStream = fs.createWriteStream(config.LOG_FILE_PATH, { flags: 'a' });
+
+// ===================================================================================
+// AI API 호출 제한 시스템 (API Rate Limiting System)
+// ===================================================================================
+class AIAPILimiter {
+    constructor(maxConcurrent = config.MAX_CONCURRENT_API_CALLS) {
+        this.maxConcurrent = maxConcurrent;
+        this.currentCalls = 0;
+        this.queue = [];
+    }
+
+    async executeAPICall(apiFunction, ...args) {
+        return new Promise((resolve, reject) => {
+            this.queue.push({ apiFunction, args, resolve, reject });
+            this.processQueue();
+        });
+    }
+
+    async processQueue() {
+        if (this.currentCalls >= this.maxConcurrent || this.queue.length === 0) {
+            return;
+        }
+
+        const { apiFunction, args, resolve, reject } = this.queue.shift();
+        this.currentCalls++;
+
+        try {
+            console.log(`[API 제한] 현재 동시 호출: ${this.currentCalls}/${this.maxConcurrent}, 대기: ${this.queue.length}`);
+            const result = await apiFunction(...args);
+            resolve(result);
+        } catch (error) {
+            console.error('[API 제한] API 호출 실패:', error.message);
+            reject(error);
+        } finally {
+            this.currentCalls--;
+            // 다음 호출을 위한 약간의 지연
+            setTimeout(() => this.processQueue(), config.API_CALL_DELAY);
+        }
+    }
+}
+
+const apiLimiter = new AIAPILimiter();
+
+// ===================================================================================
+// 공통 에러 처리 시스템 (Common Error Handling System)
+// ===================================================================================
+class ErrorHandler {
+    static async handleAsyncOperation(operation, context = 'Unknown', fallback = null) {
+        try {
+            console.log(`[${context}] 작업 시작`);
+            const result = await operation();
+            console.log(`[${context}] 작업 완료`);
+            return result;
+        } catch (error) {
+            console.error(`[${context}] 오류 발생:`, error.message);
+            console.error(`[${context}] 스택 트레이스:`, error.stack);
+            
+            if (fallback !== null) {
+                console.log(`[${context}] 폴백 값 반환:`, fallback);
+                return fallback;
+            }
+            throw error;
+        }
+    }
+
+    static handleSlideCreation(slideFunction, slide, data, slideIndex) {
+        try {
+            console.log(`[슬라이드 생성] 슬라이드 ${slideIndex + 1} 시작`);
+            slideFunction(slide, data);
+            console.log(`[슬라이드 생성] 슬라이드 ${slideIndex + 1} 완료`);
+        } catch (error) {
+            console.error(`[슬라이드 생성] 슬라이드 ${slideIndex + 1} 오류:`, error.message);
+            this.createErrorSlide(slide, `슬라이드 ${slideIndex + 1}`, error.message);
+        }
+    }
+
+    static createErrorSlide(slide, title, errorMessage) {
+        try {
+            slide.addText(`오류: ${title}`, {
+                x: 1, y: 2, w: 8, h: 1,
+                fontSize: 20, bold: true, color: 'FF0000'
+            });
+            slide.addText(`문제: ${errorMessage}`, {
+                x: 1, y: 3.5, w: 8, h: 2,
+                fontSize: 14, color: '666666'
+            });
+            slide.addText('회의록을 직접 확인해 주세요.', {
+                x: 1, y: 5.5, w: 8, h: 1,
+                fontSize: 12, color: '999999'
+            });
+        } catch (finalError) {
+            console.error('[슬라이드 생성] 오류 슬라이드 생성마저 실패:', finalError.message);
+        }
+    }
+}
+
+// ===================================================================================
+// 간소화된 텍스트 처리 시스템 (Simplified Text Processing System)
+// ===================================================================================
+class TextProcessor {
+    static safeText(value, fallback = '내용을 불러올 수 없습니다', context = 'general') {
+        if (value === null || value === undefined) return fallback;
+        
+        if (typeof value === 'string') {
+            const cleaned = value.trim();
+            return cleaned || fallback;
+        }
+        
+        if (typeof value === 'object') {
+            try {
+                if (context === 'action') return this.formatActionObject(value);
+                if (context === 'decision') return this.formatDecisionObject(value);
+                
+                if (value.title || value.name || value.content) {
+                    return value.title || value.name || value.content;
+                }
+                return JSON.stringify(value);
+            } catch (e) {
+                return fallback;
+            }
+        }
+        
+        return String(value) || fallback;
+    }
+
+    static formatActionObject(action) {
+        const parts = [];
+        if (action.action) parts.push(`액션: ${action.action}`);
+        if (action.owner) parts.push(`담당: ${action.owner}`);
+        if (action.deadline) parts.push(`마감: ${action.deadline}`);
+        return parts.join(' | ') || '액션 정보 없음';
+    }
+
+    static formatDecisionObject(decision) {
+        const parts = [];
+        if (decision.decision) parts.push(`결정: ${decision.decision}`);
+        if (decision.impact) parts.push(`영향: ${decision.impact}`);
+        if (decision.responsible) parts.push(`책임: ${decision.responsible}`);
+        return parts.join(' | ') || '결정 정보 없음';
+    }
+}
+
+// ===================================================================================
+// 통합 PPT 생성 시스템 (Unified PPT Generation System)
+// ===================================================================================
+class UnifiedPPTGenerator {
+    constructor() {
+        this.pptx = null;
+    }
+
+    async generatePPT(meetingData, pptStructure = null) {
+        return await ErrorHandler.handleAsyncOperation(async () => {
+            this.pptx = new PptxGenJS();
+            this.setupMetadata(meetingData, pptStructure);
+
+            if (pptStructure && pptStructure.slides && pptStructure.slides.length > 0) {
+                return await this.createStructuredPPT(pptStructure);
+            } else {
+                return await this.createBasicPPT(meetingData);
+            }
+        }, 'PPT 생성', null);
+    }
+
+    setupMetadata(meetingData, pptStructure) {
+        this.pptx.author = 'AI 회의록 시스템';
+        this.pptx.title = pptStructure?.title || '회의 결과 보고서';
+        this.pptx.subject = '자동 생성된 회의 보고서';
+        this.pptx.company = 'Neural Café';
+    }
+
+    async createStructuredPPT(pptStructure) {
+        console.log(`[통합 PPT] ${pptStructure.slides.length}개 구조화된 슬라이드 생성`);
+        
+        for (let i = 0; i < pptStructure.slides.length; i++) {
+            const slideData = pptStructure.slides[i];
+            const slide = this.pptx.addSlide();
+            
+            ErrorHandler.handleSlideCreation(
+                (slide, data) => this.createSlideByType(slide, data),
+                slide,
+                slideData,
+                i
+            );
+        }
+        
+        return this.pptx;
+    }
+
+    async createBasicPPT(meetingData) {
+        console.log('[통합 PPT] 기본 구조 PPT 생성');
+        
+        // 제목 슬라이드
+        const titleSlide = this.pptx.addSlide();
+        ErrorHandler.handleSlideCreation(
+            (slide, data) => this.createTitleSlide(slide, data),
+            titleSlide,
+            { title: '회의 결과 보고서', subtitle: '자동 생성된 회의록' },
+            0
+        );
+
+        // 내용 슬라이드
+        const contentSlide = this.pptx.addSlide();
+        ErrorHandler.handleSlideCreation(
+            (slide, data) => this.createContentSlide(slide, data),
+            contentSlide,
+            { title: '회의 내용', content: meetingData },
+            1
+        );
+
+        return this.pptx;
+    }
+
+    createSlideByType(slide, slideData) {
+        switch (slideData.type) {
+            case 'title':
+                this.createTitleSlide(slide, slideData);
+                break;
+            case 'agenda':
+                this.createAgendaSlide(slide, slideData);
+                break;
+            case 'topic':
+                this.createTopicSlide(slide, slideData);
+                break;
+            case 'decisions':
+                this.createDecisionsSlide(slide, slideData);
+                break;
+            case 'actions':
+                this.createActionsSlide(slide, slideData);
+                break;
+            default:
+                this.createContentSlide(slide, slideData);
+        }
+    }
+
+    createTitleSlide(slide, data) {
+        const title = TextProcessor.safeText(data.title, '회의 결과 보고서');
+        const subtitle = TextProcessor.safeText(data.subtitle, '');
+        const now = new Date();
+        const dateStr = `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, '0')}.${String(now.getDate()).padStart(2, '0')}`;
+
+        slide.addText(title, {
+            x: 1, y: 2.5, w: 8, h: 1.5,
+            fontSize: 32, bold: true,
+            align: 'center'
+        });
+
+        if (subtitle) {
+            slide.addText(subtitle, {
+                x: 1, y: 4.2, w: 8, h: 1,
+                fontSize: 18,
+                align: 'center'
+            });
+        }
+
+        slide.addText(`${dateStr} 생성`, {
+            x: 1, y: 6, w: 8, h: 0.5,
+            fontSize: 14,
+            align: 'center'
+        });
+
+        slide.addText('Neural Café', {
+            x: 7, y: 7, w: 2, h: 0.5,
+            fontSize: 12,
+            align: 'right'
+        });
+    }
+
+    createAgendaSlide(slide, data) {
+        slide.addText('📋 회의 안건 개요', {
+            x: 1, y: 1, w: 8, h: 1,
+            fontSize: 28, bold: true
+        });
+
+        slide.addText('오늘 회의에서 다뤄진 핵심 주제들', {
+            x: 1, y: 2, w: 8, h: 0.8,
+            fontSize: 16
+        });
+
+        if (data.content && Array.isArray(data.content)) {
+            data.content.forEach((item, index) => {
+                const yPos = 3.2 + (index * 0.8);
+                if (yPos < 7) {
+                    slide.addText(`• ${TextProcessor.safeText(item)}`, {
+                        x: 1.5, y: yPos, w: 7, h: 0.6,
+                        fontSize: 16
+                    });
+                }
+            });
+        }
+    }
+
+    createTopicSlide(slide, data) {
+        const title = TextProcessor.safeText(data.title, '주제');
+        slide.addText(title, {
+            x: 1, y: 1, w: 8, h: 1,
+            fontSize: 24, bold: true
+        });
+
+        if (data.subtitle) {
+            slide.addText(TextProcessor.safeText(data.subtitle), {
+                x: 1, y: 2, w: 8, h: 0.8,
+                fontSize: 16
+            });
+        }
+
+        if (data.sections && Array.isArray(data.sections)) {
+            data.sections.forEach((section, index) => {
+                const yPos = 3 + (index * 1.5);
+                if (yPos < 6.5) {
+                    slide.addText(section.title || `섹션 ${index + 1}`, {
+                        x: 1, y: yPos, w: 8, h: 0.6,
+                        fontSize: 18, bold: true
+                    });
+
+                    if (section.background) {
+                        slide.addText(`배경: ${section.background}`, {
+                            x: 1.5, y: yPos + 0.7, w: 7, h: 0.5,
+                            fontSize: 14
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    createDecisionsSlide(slide, data) {
+        slide.addText('💡 핵심 결정사항', {
+            x: 1, y: 1, w: 8, h: 1,
+            fontSize: 28, bold: true
+        });
+
+        slide.addText('회의를 통해 확정된 주요 의사결정 내용', {
+            x: 1, y: 2, w: 8, h: 0.8,
+            fontSize: 16
+        });
+
+        if (data.content && Array.isArray(data.content)) {
+            data.content.forEach((decision, index) => {
+                const yPos = 3.2 + (index * 1.2);
+                if (yPos < 6.5) {
+                    slide.addText(`${index + 1}. ${TextProcessor.safeText(decision, '결정사항', 'decision')}`, {
+                        x: 1.5, y: yPos, w: 7, h: 1,
+                        fontSize: 16
+                    });
+                }
+            });
+        }
+    }
+
+    createActionsSlide(slide, data) {
+        slide.addText('⚡ Action Items', {
+            x: 1, y: 1, w: 8, h: 1,
+            fontSize: 28, bold: true
+        });
+
+        slide.addText('회의 결과 실행해야 할 구체적인 후속 조치', {
+            x: 1, y: 2, w: 8, h: 0.8,
+            fontSize: 16
+        });
+
+        if (data.content && Array.isArray(data.content)) {
+            data.content.forEach((action, index) => {
+                const yPos = 3.2 + (index * 1.2);
+                if (yPos < 6.5) {
+                    slide.addText(`${index + 1}. ${TextProcessor.safeText(action, '액션 아이템', 'action')}`, {
+                        x: 1.5, y: yPos, w: 7, h: 1,
+                        fontSize: 16
+                    });
+                }
+            });
+        }
+    }
+
+    createContentSlide(slide, data) {
+        const title = TextProcessor.safeText(data.title, '내용');
+        slide.addText(title, {
+            x: 1, y: 1, w: 8, h: 1,
+            fontSize: 24, bold: true
+        });
+
+        if (Array.isArray(data.content)) {
+            data.content.forEach((item, index) => {
+                const yPos = 2.5 + (index * 0.6);
+                if (yPos < 7) {
+                    slide.addText(`• ${TextProcessor.safeText(item)}`, {
+                        x: 1.5, y: yPos, w: 7, h: 0.5,
+                        fontSize: 14
+                    });
+                }
+            });
+        } else {
+            slide.addText(TextProcessor.safeText(data.content, '내용이 없습니다.'), {
+                x: 1, y: 2.5, w: 8, h: 4,
+                fontSize: 16
+            });
+        }
+    }
+}
 
 // ===================================================================================
 // 대화 맥락 관리 (Conversation Context)
@@ -96,8 +502,11 @@ class ConversationContext {
             const conversationToSummarize = toSummarize.map(m => `${m.from}: ${m.content}`).join('\n');
             const prompt = `다음은 긴 대화의 일부입니다. 이 대화의 핵심 내용을 단 한 문장으로 요약해주세요: \n\n${conversationToSummarize}`;
 
-            // 요약을 위해 기존 모델 사용 (추가 비용 없음)
-            const result = await model.generateContent(prompt);
+            // API 제한 시스템을 통한 안전한 호출
+            const result = await apiLimiter.executeAPICall(
+                async (prompt) => await model.generateContent(prompt),
+                prompt
+            );
             const summaryText = (await result.response).text().trim();
 
             const summaryMessage = {
@@ -125,6 +534,9 @@ class ConversationContext {
     }
 }
 const conversationContext = new ConversationContext();
+
+// 회의록 전용 저장소 (AI 대화 컨텍스트와 분리)
+const meetingMinutesStorage = [];
 
 // ===================================================================================
 // 전역 상태 관리
@@ -343,13 +755,17 @@ ${conversationSummary}
 - 실질적이고 실행 가능한 방향으로 이끌기
 - 처음 의도한 핵심 목표 달성에 집중`;
 
-        const result = await model.generateContent({
-            contents: [{ role: 'user', parts: [{ text: moderatorPrompt }] }],
-            generationConfig: { 
+        const result = await apiLimiter.executeAPICall(
+            async (contents, config) => await model.generateContent({
+                contents: contents,
+                generationConfig: config
+            }),
+            [{ role: 'user', parts: [{ text: moderatorPrompt }] }],
+            { 
                 maxOutputTokens: 1000,
                 temperature: 0.7
             }
-        });
+        );
         
         const response = (await result.response).text().trim();
         
@@ -474,11 +890,16 @@ ${moderatorInstructions}
             console.log(`[도구 사용] 검색 키워드가 감지되어, AI '${aiName}'에게 검색 도구를 활성화합니다.`);
         }
 
-        const result = await model.generateContent({ 
-            contents, 
-            ...apiCallOptions,
-            generationConfig: { temperature: user.temperature, topK: user.topK, topP: user.topP, maxOutputTokens: 2048 } 
-        });
+        const result = await apiLimiter.executeAPICall(
+            async (contents, options, config) => await model.generateContent({ 
+                contents, 
+                ...options,
+                generationConfig: config
+            }),
+            contents,
+            apiCallOptions,
+            { temperature: user.temperature, topK: user.topK, topP: user.topP, maxOutputTokens: 2048 }
+        );
         
         // ========== 임시 토큰 사용량 로그 (삭제 예정) ==========
         const usageMetadata = (await result.response).usageMetadata;
@@ -707,23 +1128,29 @@ async function handleMeetingMinutes(initiatingMsgObj) {
     
     const meetingHistory = conversationContext.getFullHistorySnapshot(); // 전체 기록 사용
     const prompt = `
-# 지시: 회의 내용 분석 및 합성 (전문가용 회의록)
+# 지시: 전문 회의록 작성 (대기업 표준)
 
-당신은 단순한 녹취 비서가 아닌, 회의의 전체 흐름을 꿰뚫고 핵심 정보를 재구성하는 **회의 분석 전문가**입니다.
-아래에 제공되는 '전체 대화 내용'을 바탕으로, 다음 4단계의 인지적 작업을 수행하여 최고 수준의 회의록을 작성해주십시오.
+당신은 대기업의 전문 회의록 작성자입니다. 아래 대화 내용을 바탕으로 최고 수준의 구조화된 회의록을 작성해주십시오.
 
 ### 작성 프로세스
 
 1.  **[1단계: 핵심 주제 식별]**
-    전체 대화 내용을 처음부터 끝까지 정독하고, 논의된 **핵심 주제(Theme)를 3~5개 이내로 식별**합니다.
-    (예: 이스라엘 고대사, 디아스포라와 시오니즘, 현대 문화와 격투기 등)
+    전체 대화를 분석하여 논의된 **대주제를 3~5개 이내로 식별**합니다.
 
-2.  **[2단계: 내용 재분류 및 합성]**
-    시간 순서를 무시하고, 모든 참여자의 발언을 방금 식별한 각 **주제별로 재분류**하십시오.
-    그런 다음, 각 주제에 대해, 대화가 어떻게 시작되고 어떻게 심화되었는지 **하나의 완성된 이야기처럼 내용을 자연스럽게 합성(Synthesis)**하여 서술합니다. 누가 어떤 중요한 질문을 던졌고, 그에 대해 어떤 답변들이 오갔으며, 논의가 어떻게 발전했는지를 명확히 보여주어야 합니다.
+2.  **[2단계: 주제별 세부 분류]**
+    각 대주제별로 논의된 **세부 주제들을 식별**하고, 다음 논의 패턴 중 하나로 **내부적으로 분류**합니다:
+    - **문제 해결형**: 문제 제기 → 원인 분석 → 해결방안 → 결론
+    - **정보 공유형**: 정보 제시 → 질의응답 → 추가 논의 → 정리
+    - **의견 수렴형**: 주제 제시 → 다양한 관점 → 토론 → 합의점
+    - **기획/검토형**: 제안 → 검토 → 수정사항 → 승인/보류
+    
+    **중요**: 논의 패턴은 내용 구성을 위한 내부 분석 도구로만 사용하고, 최종 회의록에는 노출하지 않습니다.
 
-3.  **[3단계: 최종 구조화]**
-    아래에 명시된 "회의록 양식"에 따라 최종 결과물을 작성합니다. 특히 '주요 논의 내용' 섹션은 [2단계]에서 합성한 **주제별 내용**으로 구성하고, 각 주제에 **"1. [주제명]", "2. [주제명]"** 과 같이 번호와 명확한 소제목을 붙여주십시오.
+3.  **[3단계: 계층적 구조화]**
+    각 논의 패턴에 맞는 전문 템플릿을 내부적으로 적용하여 체계적으로 정리하되, 패턴명은 회의록에 표시하지 않습니다.
+
+4.  **[4단계: 최종 포맷팅]**
+    대기업 회의록 표준에 맞게 최종 정리합니다.
 
 ---
 
@@ -739,13 +1166,132 @@ async function handleMeetingMinutes(initiatingMsgObj) {
 (전체 대화에서 다루어진 주요 안건들을 간결하게 리스트 형식으로 요약하여 기입)
 
 #### 주요 논의 내용
-([3단계]에서 구조화한, 주제별로 합성된 내용을 여기에 기입)
+**각 대주제별로 다음과 같은 계층적 구조로 작성하시오:**
+
+## 1. [대주제명]
+
+### 1.1 [세부주제명]
+**논의 배경**: (해당 주제가 왜 논의되었는지)
+**핵심 내용**: (주요 논의 사항들을 체계적으로 정리)
+- 제기된 의견/문제점
+- 논의된 관점들
+- 제안된 해결방안/대안
+**논의 결과**: (해당 세부주제의 결론 또는 합의점)
+
+### 1.2 [다음 세부주제명]
+(위와 동일한 구조로 반복)
+
+## 2. [다음 대주제명]
+(위와 동일한 구조로 반복)
 
 #### 결정 사항
-(논의를 통해 최종적으로 합의되거나 결정된 사항들을 명확하게箇条書き(조목별로 나누어 씀) 형식으로 기입. 결정된 내용이 없다면 "해당 없음"으로 기재)
+(논의를 통해 최종적으로 합의되거나 결정된 사항들을 명확하게 조목별로 기입. 결정된 내용이 없다면 "해당 없음"으로 기재)
 
 #### 실행 항목 (Action Items)
 (결정 사항에 따라 발생한 후속 조치 사항을 기입. "담당자", "업무 내용", "기한"을 명시하여 표 형식 또는 리스트로 정리. 실행 항목이 없다면 "해당 없음"으로 기재)
+
+---
+
+### 논의 패턴별 분석 가이드 (내부 참조용)
+
+**다음은 내용 구성을 위한 내부 분석 도구입니다. 실제 회의록에는 패턴명을 노출하지 않습니다.**
+
+**문제 해결형 논의 구조:**
+- 논의 배경: 어떤 문제나 이슈가 제기되었는가?
+- 핵심 내용: 문제의 원인 → 영향도 분석 → 해결 방안들 → 방안별 장단점
+- 논의 결과: 채택된 해결방안 또는 추후 검토 방향
+
+**정보 공유형 논의 구조:**
+- 논의 배경: 어떤 정보가 공유되어야 했는가?
+- 핵심 내용: 제시된 정보 → 참여자별 질문 → 추가 설명 → 파생 논의
+- 논의 결과: 공유된 핵심 정보 요약 및 후속 조치
+
+**의견 수렴형 논의 구조:**
+- 논의 배경: 어떤 주제에 대한 의견 수렴이 필요했는가?
+- 핵심 내용: 제시된 관점들 → 찬반 의견 → 논쟁점 → 타협안
+- 논의 결과: 합의점 또는 추후 재논의 필요 사항
+
+**기획/검토형 논의 구조:**
+- 논의 배경: 어떤 계획이나 제안이 검토되었는가?
+- 핵심 내용: 제안 내용 → 검토 의견 → 수정 요구사항 → 보완방안
+- 논의 결과: 승인/조건부 승인/보류/거부 및 사유
+
+**중요 지시사항:**
+1. 각 세부주제는 반드시 위 4가지 패턴 중 하나로 **내부적으로만 분류**하고, 최종 회의록에는 패턴명을 노출하지 말 것
+2. 마크다운 헤딩을 정확히 사용하여 계층 구조를 명확히 할 것 (## 대주제, ### 세부주제)
+3. 참여자별 의견은 익명화하되, 의견의 다양성은 보존할 것
+4. 논의가 결론에 도달하지 못한 경우도 명확히 기록할 것
+5. 전문적이고 객관적인 어조를 유지할 것
+6. **표 형태 시각화 활용**: 다음 상황에서는 반드시 마크다운 표를 사용할 것
+
+### 표 활용 가이드
+
+**1. 대안/옵션 비교 시:**
+| 구분 | 옵션A | 옵션B | 옵션C |
+|------|-------|-------|-------|
+| 장점 | ... | ... | ... |
+| 단점 | ... | ... | ... |
+| 비용 | ... | ... | ... |
+| 기간 | ... | ... | ... |
+
+**2. 찬반 의견 정리 시:**
+| 논점 | 찬성 의견 | 반대 의견 | 절충안 |
+|------|-----------|-----------|--------|
+| 핵심 이슈1 | ... | ... | ... |
+| 핵심 이슈2 | ... | ... | ... |
+
+**3. 평가/검토 결과 시:**
+| 평가 기준 | 현재 상태 | 목표 | 개선 방안 |
+|-----------|-----------|------|-----------|
+| 품질 | ... | ... | ... |
+| 일정 | ... | ... | ... |
+| 예산 | ... | ... | ... |
+
+**4. 실행 항목 정리 시:**
+| 순번 | 실행 내용 | 담당자 | 완료 기한 | 우선순위 |
+|------|-----------|--------|-----------|----------|
+| 1 | ... | ... | ... | 높음 |
+| 2 | ... | ... | ... | 중간 |
+
+**5. 일정/단계별 계획 시:**
+| 단계 | 주요 활동 | 기간 | 산출물 | 비고 |
+|------|-----------|------|--------|------|
+| 1단계 | ... | ... | ... | ... |
+| 2단계 | ... | ... | ... | ... |
+
+**표 사용 원칙:**
+- 3개 이상의 항목을 비교할 때 표 사용 필수
+- 복잡한 정보를 체계적으로 정리할 때 표 우선 고려
+- 표 제목을 명확히 작성하여 내용을 쉽게 파악할 수 있도록 할 것
+- 표 내용은 간결하게 핵심만 기입할 것
+
+---
+
+### 최종 회의록 출력 예시
+
+다음과 같은 형태로 깔끔하고 전문적인 회의록이 생성되어야 합니다:
+
+예시:
+## 1. 프로젝트 진행 현황
+
+### 1.1 개발 일정 검토
+**논의 배경**: 기존 일정 대비 2주 지연 상황 발생
+**핵심 내용**:
+- 지연 원인: 기술적 복잡성 증가, 외부 API 연동 이슈
+- 영향도 분석: 전체 프로젝트 일정에 미치는 영향 검토
+- 제안된 해결방안: 우선순위 재조정, 추가 인력 투입, 외주 활용
+**논의 결과**: 핵심 기능 우선 개발 후 부가 기능은 2단계로 분리 추진
+
+### 1.2 예산 현황 점검
+**논의 배경**: 분기별 예산 사용 현황 공유 필요
+**핵심 내용**:
+표 형태로 예산 현황을 정리하되 항목, 예산, 사용액, 잔액, 사용률 등을 포함
+**논의 결과**: 개발비 추가 확보 필요, 마케팅비 일부 전용 검토
+
+**주의사항**: 
+- 논의패턴명("문제해결형", "의견수렴형" 등)은 절대 노출되지 않아야 함
+- 마크다운 헤딩(##, ###)을 정확히 사용하여 계층구조 명확화
+- 표는 복잡한 정보 정리 시 적극 활용
 
 ---
 
@@ -762,23 +1308,44 @@ ${meetingHistory.map(m => `${m.from}: ${m.content}`).join('\n')}
             ...model.generationConfig, 
             maxOutputTokens: config.MEETING_MINUTES_MAX_TOKENS 
         };
-        const result = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig });
+        const result = await apiLimiter.executeAPICall(
+            async (contents, config) => await model.generateContent({ contents, generationConfig: config }),
+            [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig
+        );
         const meetingMinutes = (await result.response).text();
 
-        io.emit(SOCKET_EVENTS.MESSAGE, {
+        const meetingNotesMessage = {
+            id: `meeting_notes_${Date.now()}`,
+            from: scribe.username,
             type: 'meeting_notes',
             content: `--- 회의록 (작성자: ${scribe.username}) ---\n\n${meetingMinutes}`,
             timestamp: new Date().toISOString()
-        });
+        };
+
+        // 회의록을 별도 저장소에 저장 (AI 대화 컨텍스트와 분리)
+        meetingMinutesStorage.push(meetingNotesMessage);
+        
+        // 클라이언트에 회의록 방송
+        io.emit(SOCKET_EVENTS.MESSAGE, meetingNotesMessage);
+        
         console.log(`[회의록 모드] ${scribe.username}이(가) 회의록 작성을 완료하고 전송했습니다. 시스템은 사용자의 다음 입력을 대기합니다.`);
 
     } catch (error) {
         console.error('회의록 생성 중 오류:', error);
-        io.emit(SOCKET_EVENTS.MESSAGE, {
+        const errorMessage = {
+            id: `meeting_error_${Date.now()}`,
+            from: 'System',
             type: 'system',
             content: `${scribe.username}이(가) 회의록을 작성하는 데 실패했습니다.`,
             timestamp: new Date().toISOString()
-        });
+        };
+        
+        // 시스템 메시지는 conversationContext에 저장 (일반 시스템 메시지이므로)
+        conversationContext.addMessage(errorMessage);
+        
+        // 클라이언트에 오류 메시지 방송
+        io.emit(SOCKET_EVENTS.MESSAGE, errorMessage);
     }
 }
 
@@ -866,9 +1433,2378 @@ async function processTurnQueue() {
 }
 
 // ===================================================================================
-// Socket.IO 연결 핸들링
+// PPT 생성 시스템
+// ===================================================================================
+
+// 🔧 구조화된 안전한 PPT 생성 함수 (AI 분석 + 색상 없는 디자인)
+function createUltraSimplePPT(meetingData, pptStructure) {
+    try {
+        console.log('[구조화 PPT] 생성 시작');
+        
+        const pptx = new PptxGenJS();
+        
+        // 기본 메타데이터 설정
+        pptx.author = 'AI 회의록 시스템';
+        pptx.title = pptStructure.title || '회의 결과 보고서';
+        
+        console.log('[구조화 PPT] 메타데이터 설정 완료');
+        
+        // pptStructure가 있으면 구조화된 슬라이드 생성, 없으면 기본 구조
+        if (pptStructure && pptStructure.slides && pptStructure.slides.length > 0) {
+            console.log(`[구조화 PPT] ${pptStructure.slides.length}개 구조화된 슬라이드 생성 시작`);
+            
+            // 각 슬라이드를 안전하게 생성
+            for (let i = 0; i < pptStructure.slides.length; i++) {
+                const slideData = pptStructure.slides[i];
+                
+                try {
+                    console.log(`[구조화 PPT] 슬라이드 ${i + 1} 생성 중: ${slideData.type}`);
+                    
+                    const slide = pptx.addSlide();
+                    
+                    // 슬라이드 타입별 안전한 생성
+                    switch (slideData.type) {
+                        case 'title':
+                            createSafeTitleSlide(slide, slideData);
+                            break;
+                        case 'agenda':
+                            createSafeAgendaSlide(slide, slideData);
+                            break;
+                        case 'topic':
+                            createSafeTopicSlide(slide, slideData);
+                            break;
+                        case 'decisions':
+                            createSafeDecisionsSlide(slide, slideData);
+                            break;
+                        case 'actions':
+                            createSafeActionsSlide(slide, slideData);
+                            break;
+                        default:
+                            createSafeContentSlide(slide, slideData);
+                    }
+                    
+                    console.log(`[구조화 PPT] 슬라이드 ${i + 1} 생성 완료`);
+                    
+                } catch (slideError) {
+                    console.error(`[구조화 PPT] 슬라이드 ${i + 1} 생성 실패:`, slideError);
+                    
+                    // 오류 슬라이드로 대체
+                    createErrorSlide(pptx.addSlide(), `슬라이드 ${i + 1}`, slideData.title || '제목 없음');
+                }
+            }
+            
+        } else {
+            console.log('[구조화 PPT] 구조 정보 없음, 기본 분석 슬라이드 생성');
+            createBasicAnalyzedSlides(pptx, meetingData);
+        }
+        
+        console.log('[구조화 PPT] 전체 생성 완료');
+        return pptx;
+        
+    } catch (error) {
+        console.error('[구조화 PPT] 생성 실패:', error);
+        return createEmergencyPPT(meetingData);
+    }
+}
+
+// 액션 객체를 사람이 읽기 쉬운 텍스트로 변환
+function formatActionObject(action) {
+    if (typeof action !== 'object' || !action) {
+        return String(action);
+    }
+    
+    const parts = [];
+    
+    // 액션 내용
+    if (action.action) {
+        parts.push(`📋 ${action.action}`);
+    }
+    
+    // 담당자
+    if (action.owner) {
+        parts.push(`👤 담당자: ${action.owner}`);
+    }
+    
+    // 기한
+    if (action.deadline) {
+        parts.push(`⏰ 기한: ${action.deadline}`);
+    }
+    
+    // 우선순위
+    if (action.priority) {
+        const priorityEmoji = action.priority === 'high' ? '🔥' : 
+                             action.priority === 'medium' ? '⚡' : '📋';
+        parts.push(`${priorityEmoji} 우선순위: ${action.priority}`);
+    }
+    
+    return parts.length > 0 ? parts.join('\n') : String(action);
+}
+
+// 결정사항 객체를 사람이 읽기 쉬운 텍스트로 변환
+function formatDecisionObject(decision) {
+    if (typeof decision !== 'object' || !decision) {
+        return String(decision);
+    }
+    
+    const parts = [];
+    
+    // 결정 내용
+    if (decision.decision) {
+        parts.push(`✅ ${decision.decision}`);
+    }
+    
+    // 배경/이유
+    if (decision.background || decision.reason) {
+        parts.push(`💡 배경: ${decision.background || decision.reason}`);
+    }
+    
+    // 담당자
+    if (decision.owner) {
+        parts.push(`👤 담당자: ${decision.owner}`);
+    }
+    
+    // 기한
+    if (decision.deadline) {
+        parts.push(`⏰ 이행 기한: ${decision.deadline}`);
+    }
+    
+    return parts.length > 0 ? parts.join('\n') : String(decision);
+}
+
+// 안전한 텍스트 변환 함수 (간소화됨)
+function safeTextForPPT(value, fallback = '내용을 불러올 수 없습니다', context = 'general') {
+    return TextProcessor.safeText(value, fallback, context);
+}
+
+// 안전한 제목 슬라이드 생성
+function createSafeTitleSlide(slide, data) {
+    // 제목
+    slide.addText(data.title || '회의 결과 보고서', {
+        x: 1, y: 2, w: 8, h: 1.5,
+        fontSize: 32,
+        bold: true,
+        align: 'center'
+    });
+    
+    // 부제목
+    if (data.subtitle) {
+        slide.addText(data.subtitle, {
+            x: 1, y: 3.8, w: 8, h: 1,
+            fontSize: 18,
+            align: 'center'
+        });
+    }
+    
+    // 날짜
+    slide.addText(new Date().toLocaleDateString('ko-KR'), {
+        x: 1, y: 5.5, w: 8, h: 0.8,
+        fontSize: 14,
+        align: 'center'
+    });
+}
+
+// 안전한 안건 슬라이드 생성
+function createSafeAgendaSlide(slide, data) {
+    // 제목
+    slide.addText(data.title || '주요 안건', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    // 안건 리스트 (최대 8개 항목만 표시)
+    const content = Array.isArray(data.content) ? data.content : ['안건 정보를 불러올 수 없습니다'];
+    const maxItems = Math.min(content.length, 8);
+    const itemsToShow = content.slice(0, maxItems);
+    
+    itemsToShow.forEach((item, index) => {
+        const yPos = 1.8 + (index * 0.7);
+        
+        // 번호
+        slide.addText(`${index + 1}.`, {
+            x: 1, y: yPos, w: 0.5, h: 0.6,
+            fontSize: 16,
+            bold: true
+        });
+        
+        // 안건 내용
+        slide.addText(safeTextForPPT(item), {
+            x: 1.5, y: yPos, w: 7.5, h: 0.6,
+            fontSize: 16,
+            wrap: true
+        });
+    });
+    
+    // 더 많은 항목이 있다면 안내 메시지 추가
+    if (content.length > maxItems) {
+        slide.addText(`... 외 ${content.length - maxItems}개 안건`, {
+            x: 1, y: 7.5, w: 8, h: 0.5,
+            fontSize: 11,
+            italic: true,
+            align: 'center'
+        });
+    }
+}
+
+// 안전한 주제 슬라이드 생성
+function createSafeTopicSlide(slide, data) {
+    // 제목
+    slide.addText(data.title || '논의 주제', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    let currentY = 1.8;
+    
+    // 섹션별 내용 (슬라이드 영역 내에서만 표시)
+    if (data.sections && Array.isArray(data.sections)) {
+        data.sections.forEach((section, index) => {
+            // 슬라이드 영역 초과 방지 (Y 위치 7.5 이하로 제한)
+            if (currentY > 7.5) {
+                slide.addText(`... 더 많은 내용이 있습니다`, {
+                    x: 0.5, y: 7.5, w: 9, h: 0.5,
+                    fontSize: 11,
+                    italic: true,
+                    align: 'center'
+                });
+                return;
+            }
+            
+            // 섹션 제목
+            slide.addText(safeTextForPPT(section.title, `섹션 ${index + 1}`), {
+                x: 0.5, y: currentY, w: 9, h: 0.6,
+                fontSize: 18,
+                bold: true
+            });
+            currentY += 0.7;
+            
+            // 주요 포인트 (최대 4개까지만)
+            if (section.keyPoints && Array.isArray(section.keyPoints)) {
+                const maxPoints = Math.min(section.keyPoints.length, 4);
+                const pointsToShow = section.keyPoints.slice(0, maxPoints);
+                
+                pointsToShow.forEach(point => {
+                    if (currentY > 7.5) return; // 영역 초과 시 중단
+                    
+                    slide.addText(`• ${safeTextForPPT(point)}`, {
+                        x: 1, y: currentY, w: 8, h: 0.5,
+                        fontSize: 14,
+                        wrap: true
+                    });
+                    currentY += 0.5;
+                });
+                
+                // 더 많은 포인트가 있다면 표시
+                if (section.keyPoints.length > maxPoints) {
+                    slide.addText(`  ... 외 ${section.keyPoints.length - maxPoints}개 포인트`, {
+                        x: 1, y: currentY, w: 8, h: 0.4,
+                        fontSize: 11,
+                        italic: true
+                    });
+                    currentY += 0.4;
+                }
+            }
+            
+            currentY += 0.3; // 섹션 간격
+        });
+    }
+}
+
+// 안전한 결정사항 슬라이드 생성
+function createSafeDecisionsSlide(slide, data) {
+    // 제목
+    slide.addText(data.title || '핵심 결정사항', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    const decisions = Array.isArray(data.content) ? data.content : 
+                    Array.isArray(data.decisions) ? data.decisions : ['결정사항이 없습니다'];
+    
+    if (decisions.length === 0 || (decisions.length === 1 && decisions[0] === '결정사항이 없습니다')) {
+        slide.addText('이번 회의에서는 구체적인 결정사항이 없었습니다.', {
+            x: 1, y: 3, w: 8, h: 1,
+            fontSize: 16,
+            align: 'center'
+        });
+    } else {
+        // 슬라이드 영역을 벗어나지 않도록 최대 4개 항목만 표시
+        const maxItems = Math.min(decisions.length, 4);
+        const itemsToShow = decisions.slice(0, maxItems);
+        
+        itemsToShow.forEach((decision, index) => {
+            const yPos = 1.8 + (index * 1.5);
+            
+            // 결정사항 번호와 내용
+            slide.addText(`결정 ${index + 1}`, {
+                x: 0.5, y: yPos, w: 2, h: 0.5,
+                fontSize: 16,
+                bold: true
+            });
+            
+            slide.addText(safeTextForPPT(decision, '내용을 불러올 수 없습니다', 'decision'), {
+                x: 2.8, y: yPos, w: 6.7, h: 1.3,
+                fontSize: 12,
+                wrap: true,
+                valign: 'top'
+            });
+        });
+        
+        // 더 많은 항목이 있다면 안내 메시지 추가
+        if (decisions.length > maxItems) {
+            slide.addText(`... 외 ${decisions.length - maxItems}개 결정사항`, {
+                x: 0.5, y: 7.5, w: 9, h: 0.5,
+                fontSize: 11,
+                italic: true,
+                align: 'center'
+            });
+        }
+    }
+}
+
+// 안전한 액션 아이템 슬라이드 생성
+function createSafeActionsSlide(slide, data) {
+    // 제목
+    slide.addText(data.title || '실행 계획', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    const actions = Array.isArray(data.content) ? data.content : 
+                   Array.isArray(data.actions) ? data.actions : ['실행 항목이 없습니다'];
+    
+    if (actions.length === 0 || (actions.length === 1 && actions[0] === '실행 항목이 없습니다')) {
+        slide.addText('구체적인 실행 항목이 정의되지 않았습니다.', {
+            x: 1, y: 3, w: 8, h: 1,
+            fontSize: 16,
+            align: 'center'
+        });
+    } else {
+        // 슬라이드 영역을 벗어나지 않도록 최대 4개 항목만 표시
+        const maxItems = Math.min(actions.length, 4);
+        const itemsToShow = actions.slice(0, maxItems);
+        
+        itemsToShow.forEach((action, index) => {
+            const yPos = 1.8 + (index * 1.5);
+            
+            // 액션 번호
+            slide.addText(`□ 액션 ${index + 1}`, {
+                x: 0.5, y: yPos, w: 2, h: 0.5,
+                fontSize: 16,
+                bold: true
+            });
+            
+            // 액션 내용
+            slide.addText(safeTextForPPT(action, '내용을 불러올 수 없습니다', 'action'), {
+                x: 2.8, y: yPos, w: 6.7, h: 1.3,
+                fontSize: 12,
+                wrap: true,
+                valign: 'top'
+            });
+        });
+        
+        // 더 많은 항목이 있다면 안내 메시지 추가
+        if (actions.length > maxItems) {
+            slide.addText(`... 외 ${actions.length - maxItems}개 액션 아이템`, {
+                x: 0.5, y: 7.5, w: 9, h: 0.5,
+                fontSize: 11,
+                italic: true,
+                align: 'center'
+            });
+        }
+    }
+}
+
+// 안전한 일반 컨텐츠 슬라이드 생성
+function createSafeContentSlide(slide, data) {
+    // 제목
+    slide.addText(data.title || '내용', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    // 내용
+    const content = Array.isArray(data.content) ? data.content.join('\n\n') : 
+                   typeof data.content === 'string' ? data.content : '내용을 불러올 수 없습니다';
+    
+    slide.addText(content, {
+        x: 0.5, y: 1.8, w: 9, h: 5,
+        fontSize: 14,
+        wrap: true
+    });
+}
+
+// 오류 슬라이드 생성
+function createErrorSlide(slide, slideTitle, contentTitle) {
+    slide.addText(`❌ ${slideTitle} 생성 오류`, {
+        x: 1, y: 2, w: 8, h: 1,
+        fontSize: 20,
+        bold: true,
+        align: 'center'
+    });
+    
+    slide.addText(`${contentTitle} 슬라이드를 생성하는 중 오류가 발생했습니다.`, {
+        x: 1, y: 3.5, w: 8, h: 1,
+        fontSize: 16,
+        align: 'center'
+    });
+}
+
+// 기본 분석 슬라이드 생성 (구조 정보가 없을 때)
+function createBasicAnalyzedSlides(pptx, meetingData) {
+    // 제목 슬라이드
+    const titleSlide = pptx.addSlide();
+    createSafeTitleSlide(titleSlide, { title: '회의 결과 보고서' });
+    
+    // 내용 분석 슬라이드
+    const contentSlide = pptx.addSlide();
+    contentSlide.addText('주요 논의 내용', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    // 회의 데이터 기본 분석
+    let analysisText = '회의 내용이 충분하지 않습니다.';
+    if (meetingData && meetingData.length > 100) {
+        const lines = meetingData.split('\n').filter(line => line.trim().length > 20);
+        const keyLines = lines.slice(0, 8).map((line, index) => `${index + 1}. ${line.substring(0, 80)}...`);
+        analysisText = keyLines.join('\n\n');
+    }
+    
+    contentSlide.addText(analysisText, {
+        x: 0.5, y: 1.8, w: 9, h: 5,
+        fontSize: 12,
+        wrap: true
+    });
+    
+    // 요약 슬라이드
+    const summarySlide = pptx.addSlide();
+    summarySlide.addText('회의 요약', {
+        x: 0.5, y: 0.5, w: 9, h: 1,
+        fontSize: 24,
+        bold: true
+    });
+    
+    summarySlide.addText('• 회의 일시: ' + new Date().toLocaleDateString('ko-KR'), {
+        x: 1, y: 2, w: 8, h: 0.6,
+        fontSize: 16
+    });
+    
+    summarySlide.addText('• 회의 형태: 온라인 채팅 회의', {
+        x: 1, y: 2.8, w: 8, h: 0.6,
+        fontSize: 16
+    });
+    
+    summarySlide.addText('• 자동 생성: AI 회의록 시스템', {
+        x: 1, y: 3.6, w: 8, h: 0.6,
+        fontSize: 16
+    });
+}
+
+// 응급 PPT 생성 (모든 것이 실패했을 때)
+function createEmergencyPPT(meetingData) {
+    try {
+        console.log('[응급 PPT] 생성 시도');
+        
+        const emergencyPptx = new PptxGenJS();
+        emergencyPptx.author = 'AI';
+        emergencyPptx.title = '응급 보고서';
+        
+        const slide = emergencyPptx.addSlide();
+        slide.addText('회의 결과 (응급 버전)', {
+            x: 1, y: 2, w: 8, h: 1,
+            fontSize: 24,
+            bold: true
+        });
+        
+        slide.addText('PPT 생성 중 일부 오류가 발생했습니다.\n기본 정보만 포함되어 있습니다.', {
+            x: 1, y: 4, w: 8, h: 2,
+            fontSize: 16
+        });
+        
+        console.log('[응급 PPT] 생성 성공');
+        return emergencyPptx;
+        
+    } catch (error) {
+        console.error('[응급 PPT] 생성도 실패:', error);
+        return null;
+    }
+}
+async function generatePptStructure(meetingData) {
+    try {
+        const prompt = `
+# 프리미엄 PPT 제작 전문가
+
+당신은 세계 최고 수준의 프레젠테이션 디자이너입니다. 아래 회의록을 바탕으로 **경영진 수준의 고급 PPT**를 제작하기 위한 구조화된 데이터를 생성해주세요.
+
+## 회의록 원본
+${meetingData}
+
+## PPT 제작 지침
+
+### 1. 슬라이드 구성 원칙
+- **임팩트 우선**: 핵심 메시지가 즉시 전달되도록
+- **시각적 계층**: 정보의 중요도에 따른 시각적 구분
+- **스토리텔링**: 논리적 흐름으로 설득력 극대화
+
+### 2. 출력 형식
+다음 JSON 구조로 정확히 출력하세요:
+
+\`\`\`json
+{
+  "title": "회의명 (간결하고 임팩트 있게)",
+  "subtitle": "핵심 메시지 한 줄 요약",
+  "metadata": {
+    "date": "회의 일시",
+    "participants": "참석자 수",
+    "duration": "예상 논의 시간",
+    "classification": "회의 분류 (전략/운영/프로젝트/기타)"
+  },
+  "slides": [
+    {
+      "type": "title",
+      "title": "표지 제목",
+      "subtitle": "부제목",
+      "design": "executive"
+    },
+    {
+      "type": "agenda",
+      "title": "주요 안건",
+      "content": ["안건1", "안건2", "안건3"],
+      "design": "clean"
+    },
+    {
+      "type": "topic",
+      "title": "대주제명",
+      "subtitle": "주제 요약 한 줄",
+      "sections": [
+        {
+          "title": "세부주제명",
+          "type": "content/table/chart",
+          "background": "논의 배경",
+          "keyPoints": ["핵심 포인트1", "핵심 포인트2"],
+          "conclusion": "결론",
+          "visual": {
+            "type": "table/chart/bullet",
+            "data": "시각화할 데이터"
+          }
+        }
+      ],
+      "design": "professional"
+    },
+    {
+      "type": "decisions",
+      "title": "핵심 결정사항",
+      "content": [
+        {
+          "decision": "결정 내용",
+          "priority": "high/medium/low",
+          "impact": "영향도 설명"
+        }
+      ],
+      "design": "highlight"
+    },
+    {
+      "type": "actions",
+      "title": "Action Items",
+      "content": [
+        {
+          "action": "실행 내용",
+          "owner": "담당자",
+          "deadline": "완료 기한",
+          "priority": "우선순위"
+        }
+      ],
+      "design": "actionable"
+    }
+  ]
+}
+\`\`\`
+
+### 3. 고급 기능 활용
+- **표 데이터**: 3개 이상 비교 항목은 표로 변환
+- **시각적 강조**: 중요 키워드는 별도 표시
+- **구조화**: 우선순위/중요도별 배치 최적화
+
+### 4. 디자인 테마
+- **executive**: 최고급 경영진용 (미니멀, 고급스러움)
+- **professional**: 전문적 업무용 (깔끔, 체계적)  
+- **clean**: 정보 전달용 (명확, 읽기 쉬움)
+- **highlight**: 강조용 (임팩트, 주목성)
+- **actionable**: 실행용 (명확한 액션 유도)
+
+중요: 반드시 유효한 JSON 형식으로만 출력하고, 추가 설명은 하지 마세요.
+        `;
+
+        const result = await apiLimiter.executeAPICall(
+            async (contents, config) => await model.generateContent({
+                contents: contents,
+                generationConfig: config
+            }),
+            [{ role: 'user', parts: [{ text: prompt }] }],
+            { 
+                maxOutputTokens: 4000,
+                temperature: 0.3
+            }
+        );
+        
+        const response = (await result.response).text().trim();
+        
+        // JSON 추출 (코드 블록 제거)
+        const jsonMatch = response.match(/```json\n([\s\S]*?)\n```/) || response.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            const jsonStr = jsonMatch[1] || jsonMatch[0];
+            return JSON.parse(jsonStr);
+        }
+        
+        // JSON 파싱 실패 시 기본 구조 반환
+        throw new Error('JSON 파싱 실패');
+        
+    } catch (error) {
+        console.error('[PPT 구조화 오류]:', error);
+        return getDefaultPptStructure();
+    }
+}
+
+function getDefaultPptStructure() {
+    return {
+        title: "회의 결과 보고서",
+        subtitle: "주요 논의사항 및 결정사항",
+        metadata: {
+            date: new Date().toLocaleDateString('ko-KR'),
+            participants: getParticipantNames().length + "명",
+            classification: "일반"
+        },
+        slides: [
+            {
+                type: "title",
+                title: "회의 결과 보고서",
+                subtitle: "주요 논의사항 및 결정사항",
+                design: "executive"
+            },
+            {
+                type: "content",
+                title: "회의록을 PPT로 변환 중 오류가 발생했습니다",
+                content: ["회의록 내용을 직접 확인해주세요"],
+                design: "clean"
+            }
+        ]
+    };
+}
+
+async function createPowerPoint(pptStructure) {
+    const pptx = new PptxGenJS();
+    
+    // 회사 브랜딩 설정
+    pptx.author = 'AI 회의록 시스템';
+    pptx.company = 'ChatApp Pro';
+    pptx.subject = pptStructure.title;
+    pptx.title = pptStructure.title;
+    
+            // 간소화된 마스터 슬라이드 설정
+        pptx.defineSlideMaster({
+            title: 'MASTER_SLIDE',
+            objects: []  // 플레이스홀더 제거로 호환성 향상
+        });
+
+    // 슬라이드별 생성
+    for (const slideData of pptStructure.slides) {
+        const slide = pptx.addSlide({ masterName: 'MASTER_SLIDE' });
+        
+        switch (slideData.type) {
+            case 'title':
+                createTitleSlide(slide, slideData);
+                break;
+            case 'agenda':
+                createAgendaSlide(slide, slideData);
+                break;
+            case 'topic':
+                createTopicSlide(slide, slideData);
+                break;
+            case 'decisions':
+                createDecisionsSlide(slide, slideData);
+                break;
+            case 'actions':
+                createActionsSlide(slide, slideData);
+                break;
+            default:
+                createContentSlide(slide, slideData);
+        }
+    }
+    
+    return pptx;
+}
+
+// 안전한 PPT 생성 함수 (완전 방어적 프로그래밍)
+async function createPowerPointSafely(pptStructure) {
+    let pptx = null;
+    
+    try {
+        console.log('[PPT 안전 생성] PPT 객체 초기화 시작');
+        
+        // PPT 구조 검증
+        if (!pptStructure) {
+            throw new Error('PPT 구조가 null입니다');
+        }
+        
+        if (!pptStructure.slides || !Array.isArray(pptStructure.slides)) {
+            console.warn('[PPT 안전 생성] 슬라이드 배열이 없거나 잘못된 형식입니다. 기본 구조로 대체합니다.');
+            pptStructure = getDefaultPptStructure();
+        }
+        
+        if (pptStructure.slides.length === 0) {
+            console.warn('[PPT 안전 생성] 슬라이드가 비어있습니다. 기본 슬라이드를 추가합니다.');
+            pptStructure.slides.push({
+                type: 'content',
+                title: '회의 결과',
+                content: ['회의록을 확인해 주세요.']
+            });
+        }
+        
+        // PPT 객체 생성
+        pptx = new PptxGenJS();
+        
+        // 회사 브랜딩 설정 (안전한 기본값 사용)
+        pptx.author = 'AI 회의록 시스템';
+        pptx.company = 'ChatApp Pro';
+        pptx.subject = String(pptStructure.title || '회의 결과 보고서');
+        pptx.title = String(pptStructure.title || '회의 결과 보고서');
+        
+        console.log('[PPT 안전 생성] PPT 객체 초기화 완료');
+        
+        // 마스터 슬라이드 설정 (최대한 안전하게, 필수 아님)
+        let useMasterSlide = false;
+        try {
+            pptx.defineSlideMaster({
+                title: 'MASTER_SLIDE',
+                objects: []  // 간소화된 설정
+            });
+            useMasterSlide = true;
+            console.log('[PPT 안전 생성] 마스터 슬라이드 설정 완료');
+        } catch (masterError) {
+            console.warn('[PPT 안전 생성] 마스터 슬라이드 설정 건너뜀:', masterError.message);
+            useMasterSlide = false;
+            // 마스터 슬라이드 없이 진행 (더 안전)
+        }
+
+        // 슬라이드별 안전한 생성
+        console.log(`[PPT 안전 생성] ${pptStructure.slides.length}개 슬라이드 생성 시작`);
+        
+        for (let i = 0; i < pptStructure.slides.length; i++) {
+            const slideData = pptStructure.slides[i];
+            
+            try {
+                console.log(`[PPT 안전 생성] 슬라이드 ${i + 1} 생성 중 (${slideData.type})`);
+                
+                // 마스터 슬라이드 사용 여부에 따라 슬라이드 생성
+                const slide = useMasterSlide ? 
+                    pptx.addSlide({ masterName: 'MASTER_SLIDE' }) : 
+                    pptx.addSlide();
+                
+                // 슬라이드 타입별 안전한 생성
+                switch (slideData.type) {
+                    case 'title':
+                        createTitleSlideSafely(slide, slideData, i);
+                        break;
+                    case 'agenda':
+                        createAgendaSlideSafely(slide, slideData, i);
+                        break;
+                    case 'topic':
+                        createTopicSlideSafely(slide, slideData, i);
+                        break;
+                    case 'decisions':
+                        createDecisionsSlideSafely(slide, slideData, i);
+                        break;
+                    case 'actions':
+                        createActionsSlideSafely(slide, slideData, i);
+                        break;
+                    default:
+                        createContentSlideSafely(slide, slideData, i);
+                }
+                
+                console.log(`[PPT 안전 생성] 슬라이드 ${i + 1} 생성 완료`);
+                
+            } catch (slideError) {
+                console.error(`[PPT 안전 생성] 슬라이드 ${i + 1} 생성 실패:`, slideError);
+                
+                // 폴백: 오류 슬라이드 생성
+                try {
+                    const errorSlide = useMasterSlide ? 
+                        pptx.addSlide({ masterName: 'MASTER_SLIDE' }) : 
+                        pptx.addSlide();
+                    errorSlide.addText(`슬라이드 ${i + 1} 생성 오류`, safeSlideOptions({
+                        x: 1, y: 2, w: 8, h: 1,
+                        fontSize: 18,
+                        color: 'D32F2F',
+                        fontFace: 'Segoe UI'
+                    }));
+                    errorSlide.addText('이 슬라이드는 생성 중 오류가 발생했습니다.', safeSlideOptions({
+                        x: 1, y: 3.5, w: 8, h: 0.5,
+                        fontSize: 14,
+                        color: '666666',
+                        fontFace: 'Segoe UI'
+                    }));
+                } catch (fallbackError) {
+                    console.error(`[PPT 안전 생성] 폴백 슬라이드 생성도 실패:`, fallbackError);
+                }
+            }
+        }
+        
+        console.log('[PPT 안전 생성] 모든 슬라이드 생성 완료');
+        return pptx;
+        
+            } catch (error) {
+            console.error('[PPT 안전 생성] 치명적 오류:', error);
+            
+            // 최종 폴백: 극도로 단순한 PPT 생성
+            try {
+                console.log('[PPT 안전 생성] 최종 폴백 PPT 생성 시도');
+                
+                const fallbackPptx = new PptxGenJS();
+                fallbackPptx.author = 'AI 회의록 시스템';
+                fallbackPptx.title = '회의 결과 보고서';
+                
+                // 극도로 단순한 슬라이드 (복잡한 옵션 일체 없음)
+                const fallbackSlide = fallbackPptx.addSlide();
+                
+                // 최소한의 텍스트만 추가
+                fallbackSlide.addText('회의 결과 보고서', {
+                    x: 1, y: 2, w: 8, h: 1,
+                    fontSize: 24,
+                    bold: true,
+                    color: '333333'
+                });
+                
+                fallbackSlide.addText('PPT 생성 중 오류가 발생했습니다.', {
+                    x: 1, y: 3.5, w: 8, h: 1,
+                    fontSize: 16,
+                    color: '666666'
+                });
+                
+                fallbackSlide.addText('회의록을 확인해 주세요.', {
+                    x: 1, y: 4.5, w: 8, h: 1,
+                    fontSize: 16,
+                    color: '666666'
+                });
+                
+                console.log('[PPT 안전 생성] 최종 폴백 PPT 생성 성공');
+                return fallbackPptx;
+                
+            } catch (fallbackError) {
+                console.error('[PPT 안전 생성] 최종 폴백도 실패:', fallbackError);
+                
+                // 궁극의 폴백: 빈 PPT라도 생성
+                try {
+                    const emptyPptx = new PptxGenJS();
+                    emptyPptx.author = 'AI 회의록 시스템';
+                    emptyPptx.title = '오류 발생';
+                    
+                    const emptySlide = emptyPptx.addSlide();
+                    emptySlide.addText('오류', { x: 1, y: 3, w: 8, h: 1 });
+                    
+                    console.log('[PPT 안전 생성] 궁극 폴백 성공');
+                    return emptyPptx;
+                } catch (ultimateError) {
+                    console.error('[PPT 안전 생성] 모든 폴백 실패:', ultimateError);
+                    return null;
+                }
+            }
+        }
+}
+
+// 안전한 슬라이드 생성 함수들
+function createTitleSlideSafely(slide, data, index) {
+    try {
+        createTitleSlide(slide, data);
+    } catch (error) {
+        console.error(`[제목 슬라이드 ${index + 1} 오류]:`, error);
+        createFallbackSlide(slide, '제목 슬라이드', `슬라이드 ${index + 1}: 제목 슬라이드 생성 중 오류가 발생했습니다.`);
+    }
+}
+
+function createAgendaSlideSafely(slide, data, index) {
+    try {
+        createAgendaSlide(slide, data);
+    } catch (error) {
+        console.error(`[안건 슬라이드 ${index + 1} 오류]:`, error);
+        createFallbackSlide(slide, '주요 안건', `슬라이드 ${index + 1}: 안건 슬라이드 생성 중 오류가 발생했습니다.`);
+    }
+}
+
+function createTopicSlideSafely(slide, data, index) {
+    try {
+        createTopicSlide(slide, data);
+    } catch (error) {
+        console.error(`[주제 슬라이드 ${index + 1} 오류]:`, error);
+        createFallbackSlide(slide, '주제 슬라이드', `슬라이드 ${index + 1}: 주제 슬라이드 생성 중 오류가 발생했습니다.`);
+    }
+}
+
+function createDecisionsSlideSafely(slide, data, index) {
+    try {
+        createDecisionsSlide(slide, data);
+    } catch (error) {
+        console.error(`[결정사항 슬라이드 ${index + 1} 오류]:`, error);
+        createFallbackSlide(slide, '핵심 결정사항', `슬라이드 ${index + 1}: 결정사항 슬라이드 생성 중 오류가 발생했습니다.`);
+    }
+}
+
+function createActionsSlideSafely(slide, data, index) {
+    try {
+        createActionsSlide(slide, data);
+    } catch (error) {
+        console.error(`[액션 슬라이드 ${index + 1} 오류]:`, error);
+        createFallbackSlide(slide, 'Action Items', `슬라이드 ${index + 1}: 액션 아이템 슬라이드 생성 중 오류가 발생했습니다.`);
+    }
+}
+
+function createContentSlideSafely(slide, data, index) {
+    try {
+        createContentSlide(slide, data);
+    } catch (error) {
+        console.error(`[콘텐츠 슬라이드 ${index + 1} 오류]:`, error);
+        createFallbackSlide(slide, '내용', `슬라이드 ${index + 1}: 콘텐츠 슬라이드 생성 중 오류가 발생했습니다.`);
+    }
+}
+
+// 폴백 슬라이드 생성 함수
+function createFallbackSlide(slide, title, message) {
+    try {
+        slide.addText(title, safeSlideOptions({
+            x: 1, y: 1.5, w: 8, h: 1,
+            fontSize: 24,
+            bold: true,
+            color: 'D32F2F',
+            fontFace: 'Segoe UI'
+        }));
+        
+        slide.addText(message, safeSlideOptions({
+            x: 1, y: 3, w: 8, h: 2,
+            fontSize: 16,
+            color: '666666',
+            fontFace: 'Segoe UI',
+            valign: 'top'
+        }));
+        
+        slide.addText('회의록을 직접 확인해 주세요.', safeSlideOptions({
+            x: 1, y: 5.5, w: 8, h: 0.5,
+            fontSize: 14,
+            color: '999999',
+            fontFace: 'Segoe UI',
+            align: 'center'
+        }));
+    } catch (fallbackError) {
+        console.error('[폴백 슬라이드 생성 오류]:', fallbackError);
+        // 최소한의 텍스트라도 추가 시도
+        try {
+            slide.addText('오류 발생', safeSlideOptions({
+                x: 1, y: 3, w: 8, h: 1,
+                fontSize: 18,
+                color: '333333',
+                fontFace: 'Arial'
+            }));
+        } catch (minimalError) {
+            console.error('[최소 폴백도 실패]:', minimalError);
+        }
+    }
+}
+
+function createTitleSlide(slide, data) {
+    try {
+        // 🎨 단순한 배경 (그라데이션 제거, 안전성 우선)
+        try {
+            slide.background = { fill: '4472C4' }; // 단순 문자열 색상
+        } catch (bgError) {
+            console.warn('[배경 설정 실패]:', bgError.message);
+            // 배경 없이 진행
+        }
+        
+        // 📝 메인 제목 - 단순하고 안전하게
+        const mainTitle = data.title || '회의 결과 보고서';
+        slide.addText(mainTitle, safeSlideOptions({
+            x: 0.5, y: 2, w: 9, h: 1.8,
+            fontSize: 44,
+            bold: true,
+            color: 'FFFFFF',
+            align: 'center',
+            fontFace: 'Segoe UI'
+            // shadow 제거 (색상 오류 방지)
+        }));
+        
+        // 📄 부제목 - 더 명확한 설명
+        const subtitle = data.subtitle || '핵심 논의사항, 결정사항 및 액션 플랜';
+        slide.addText(subtitle, safeSlideOptions({
+            x: 1, y: 4.2, w: 8, h: 1,
+            fontSize: 20,
+            color: 'F0F8FF',
+            align: 'center',
+            fontFace: 'Segoe UI Light'
+        }));
+        
+        // 🗓️ 날짜 및 메타 정보
+        const today = new Date();
+        const dateStr = today.toLocaleDateString('ko-KR', {
+            year: 'numeric',
+            month: 'long', 
+            day: 'numeric'
+        });
+        
+        slide.addText(`${dateStr} 생성`, safeSlideOptions({
+            x: 6.5, y: 6.8, w: 2.5, h: 0.4,
+            fontSize: 12,
+            color: 'E6F3FF',
+            align: 'right',
+            fontFace: 'Segoe UI'
+        }));
+        
+        // 🏢 회사/팀 로고 영역 (텍스트로 대체)
+        slide.addText('Neural Café', safeSlideOptions({
+            x: 0.5, y: 6.8, w: 2.5, h: 0.4,
+            fontSize: 12,
+            color: 'E6F3FF',
+            align: 'left',
+            fontFace: 'Segoe UI',
+            italic: true
+        }));
+        
+        // ✨ 장식적 요소 - 단순한 라인 (색상 오류 방지)
+        try {
+            slide.addShape('rect', {
+                x: 2, y: 5.5, w: 6, h: 0.05,
+                fill: 'FFFFFF'
+                // transparency 제거 (호환성 문제 가능성)
+            });
+        } catch (shapeError) {
+            console.warn('[장식 요소 생성 실패]:', shapeError.message);
+            // 장식 없이 진행
+        }
+        
+    } catch (error) {
+        console.error('[제목 슬라이드 생성 오류]:', error);
+        // 폴백: 깔끔한 기본 제목 슬라이드
+        slide.addText('회의 결과 보고서', safeSlideOptions({
+            x: 1, y: 3, w: 8, h: 1.5,
+            fontSize: 32,
+            bold: true,
+            color: '2E4F8C',
+            align: 'center',
+            fontFace: 'Segoe UI'
+        }));
+        
+        slide.addText('주요 내용 및 결정사항', safeSlideOptions({
+            x: 1, y: 4.5, w: 8, h: 0.8,
+            fontSize: 16,
+            color: '5A6C7D',
+            align: 'center',
+            fontFace: 'Segoe UI Light'
+        }));
+    }
+}
+
+function createAgendaSlide(slide, data) {
+    try {
+        // 🎯 헤더 섹션 - 목적이 명확한 제목
+        slide.addText('📋 회의 안건 개요', safeSlideOptions({
+            x: 0.5, y: 0.3, w: 9, h: 0.8,
+            fontSize: 32,
+            bold: true,
+            color: '2E4F8C',
+            fontFace: 'Segoe UI'
+        }));
+        
+        // 📝 부제목 - 슬라이드 목적 설명
+        slide.addText('오늘 회의에서 다뤄진 핵심 주제들', safeSlideOptions({
+            x: 0.5, y: 1.1, w: 9, h: 0.5,
+            fontSize: 16,
+            color: '6C7B8A',
+            fontFace: 'Segoe UI Light'
+        }));
+        
+        // 🎨 구분선 (단순화)
+        try {
+            slide.addShape('rect', {
+                x: 0.5, y: 1.8, w: 9, h: 0.03,
+                fill: '4472C4'
+            });
+        } catch (shapeError) {
+            console.warn('[구분선 생성 실패]:', shapeError.message);
+        }
+        
+        // 📌 안건 리스트 - 더 체계적으로
+        const contentArray = Array.isArray(data.content) ? data.content : ['안건 정보를 불러올 수 없습니다'];
+        
+        contentArray.forEach((item, index) => {
+            const yPos = 2.3 + (index * 0.9);
+            
+            // 🔢 번호 배지 (단순화)
+            try {
+                slide.addShape('rect', {
+                    x: 0.7, y: yPos - 0.1, w: 0.6, h: 0.6,
+                    fill: '4472C4'
+                    // line 속성 제거 (색상 오류 방지)
+                });
+                
+                slide.addText(`${index + 1}`, {
+                    x: 0.8, y: yPos, w: 0.4, h: 0.4,
+                    fontSize: 16,
+                    bold: true,
+                    color: 'FFFFFF',
+                    align: 'center',
+                    fontFace: 'Segoe UI'
+                });
+            } catch (badgeError) {
+                console.warn('[번호 배지 생성 실패]:', badgeError.message);
+            }
+            
+            // 📄 안건 내용
+            slide.addText(item, safeSlideOptions({
+                x: 1.5, y: yPos, w: 7.5, h: 0.7,
+                fontSize: 18,
+                color: '2D3748',
+                fontFace: 'Segoe UI',
+                valign: 'middle'
+            }));
+            
+            // ✨ 미묘한 구분선 (마지막 항목 제외)
+            if (index < contentArray.length - 1) {
+                try {
+                    slide.addShape('rect', {
+                        x: 1.5, y: yPos + 0.7, w: 7.5, h: 0.01,
+                        fill: 'E2E8F0'
+                    });
+                } catch (lineError) {
+                    console.warn('[구분선 생성 실패]:', lineError.message);
+                }
+            }
+        });
+        
+        // 📊 안건 수 요약
+        if (contentArray.length > 1) {
+            slide.addText(`총 ${contentArray.length}개 안건`, safeSlideOptions({
+                x: 7.5, y: 6.5, w: 2, h: 0.4,
+                fontSize: 12,
+                color: '718096',
+                align: 'right',
+                fontFace: 'Segoe UI',
+                italic: true
+            }));
+        }
+        
+    } catch (error) {
+        console.error('[안건 슬라이드 생성 오류]:', error);
+        slide.addText('❌ 안건 정보 로드 실패', safeSlideOptions({
+            x: 1, y: 3, w: 8, h: 1,
+            fontSize: 20,
+            color: 'E53E3E',
+            align: 'center',
+            fontFace: 'Segoe UI'
+        }));
+        
+        slide.addText('회의록을 다시 확인해주세요', safeSlideOptions({
+            x: 1, y: 4, w: 8, h: 0.6,
+            fontSize: 14,
+            color: '718096',
+            align: 'center',
+            fontFace: 'Segoe UI Light'
+        }));
+    }
+}
+
+function createTopicSlide(slide, data) {
+    try {
+        // 제목
+        slide.addText(data.title || '주제', safeSlideOptions({
+            x: 0.5, y: 0.3, w: 9, h: 0.8,
+            fontSize: 24,
+            bold: true,
+            color: '4472C4',
+            fontFace: 'Segoe UI'
+        }));
+        
+        // 부제목
+        if (data.subtitle) {
+            slide.addText(data.subtitle, safeSlideOptions({
+                x: 0.5, y: 1, w: 9, h: 0.5,
+                fontSize: 14,
+                color: '666666',
+                fontFace: 'Segoe UI'
+            }));
+        }
+        
+        let currentY = 1.8;
+        
+        // 섹션별 내용
+        const sections = Array.isArray(data.sections) ? data.sections : [];
+        sections.forEach((section, index) => {
+            try {
+                // 섹션 제목
+                slide.addText(section.title || `섹션 ${index + 1}`, safeSlideOptions({
+                    x: 0.5, y: currentY, w: 9, h: 0.6,
+                    fontSize: 18,
+                    bold: true,
+                    color: '333333',
+                    fontFace: 'Segoe UI'
+                }));
+                currentY += 0.7;
+                
+                // 배경 정보
+                if (section.background) {
+                    slide.addText(`배경: ${section.background}`, safeSlideOptions({
+                        x: 0.7, y: currentY, w: 8.5, h: 0.4,
+                        fontSize: 12,
+                        color: '666666',
+                        fontFace: 'Segoe UI'
+                    }));
+                    currentY += 0.5;
+                }
+                
+                // 핵심 포인트
+                if (section.keyPoints && Array.isArray(section.keyPoints) && section.keyPoints.length > 0) {
+                    section.keyPoints.forEach(point => {
+                        if (point && typeof point === 'string') {
+                            slide.addText(`• ${point}`, safeSlideOptions({
+                                x: 0.7, y: currentY, w: 8.5, h: 0.4,
+                                fontSize: 14,
+                                color: '333333',
+                                fontFace: 'Segoe UI'
+                            }));
+                            currentY += 0.4;
+                        }
+                    });
+                }
+                
+                // 표나 차트가 있는 경우 (강화된 오류 처리)
+                if (section.visual?.type === 'table' && section.visual.data) {
+                    console.log(`[테이블 처리 시작] 섹션: ${section.title}, 데이터:`, section.visual.data);
+                    createTableInSlide(slide, section.visual.data, currentY);
+                    currentY += 2; // 표 공간 확보
+                }
+                
+                // 결론
+                if (section.conclusion) {
+                    slide.addText(`결론: ${section.conclusion}`, safeSlideOptions({
+                        x: 0.7, y: currentY, w: 8.5, h: 0.4,
+                        fontSize: 14,
+                        bold: true,
+                        color: '2E7D32',
+                        fontFace: 'Segoe UI'
+                    }));
+                    currentY += 0.6;
+                }
+                
+                currentY += 0.3; // 섹션 간 간격
+                
+            } catch (sectionError) {
+                console.error(`[섹션 ${index + 1} 처리 오류]:`, sectionError);
+                slide.addText(`⚠️ 섹션 ${index + 1} 처리 중 오류 발생`, safeSlideOptions({
+                    x: 0.7, y: currentY, w: 8.5, h: 0.4,
+                    fontSize: 12,
+                    color: 'D32F2F',
+                    fontFace: 'Segoe UI'
+                }));
+                currentY += 0.6;
+            }
+        });
+        
+    } catch (error) {
+        console.error('[주제 슬라이드 생성 오류]:', error);
+        slide.addText('주제 슬라이드 생성 중 오류가 발생했습니다', safeSlideOptions({
+            x: 1, y: 2, w: 8, h: 1,
+            fontSize: 16,
+            color: 'D32F2F',
+            fontFace: 'Segoe UI'
+        }));
+    }
+}
+
+function createDecisionsSlide(slide, data) {
+    try {
+        // 🎯 임팩트 있는 헤더
+        slide.addText('💡 핵심 결정사항', safeSlideOptions({
+            x: 0.5, y: 0.3, w: 9, h: 0.8,
+            fontSize: 32,
+            bold: true,
+            color: 'C53030',
+            fontFace: 'Segoe UI'
+        }));
+        
+        // 📋 슬라이드 목적 설명
+        slide.addText('회의를 통해 확정된 주요 의사결정 내용', safeSlideOptions({
+            x: 0.5, y: 1.1, w: 9, h: 0.5,
+            fontSize: 16,
+            color: '6C7B8A',
+            fontFace: 'Segoe UI Light'
+        }));
+        
+        // 🎨 강조 구분선
+        slide.addShape('rect', safeSlideOptions({
+            x: 0.5, y: 1.8, w: 9, h: 0.05,
+            fill: 'C53030'
+        }));
+        
+        // 📊 결정사항 리스트 - 카드 형태로
+        const decisions = Array.isArray(data.content) ? data.content : [];
+        
+        if (decisions.length > 0) {
+            decisions.forEach((decision, index) => {
+                try {
+                    const yPos = 2.4 + (index * 1.3);
+                    
+                    // 🎨 우선순위별 색상 매핑
+                    const priorityConfig = {
+                        'high': { color: 'E53E3E', icon: '🔴', label: '높음' },
+                        'medium': { color: 'F56500', icon: '🟡', label: '보통' },
+                        'low': { color: '38A169', icon: '🟢', label: '낮음' }
+                    };
+                    
+                    const priority = decision.priority || 'medium';
+                    const config = priorityConfig[priority] || priorityConfig['medium'];
+                    
+                    // 📦 결정사항 카드 배경
+                    slide.addShape('rect', safeSlideOptions({
+                        x: 0.5, y: yPos - 0.1, w: 9, h: 1.1,
+                        fill: 'F7FAFC',
+                        line: { color: 'E2E8F0', width: 1 }
+                    }));
+                    
+                    // 🏷️ 우선순위 배지
+                    slide.addShape('rect', safeSlideOptions({
+                        x: 8.5, y: yPos, w: 0.8, h: 0.3,
+                        fill: config.color
+                    }));
+                    
+                    slide.addText(config.label, safeSlideOptions({
+                        x: 8.5, y: yPos, w: 0.8, h: 0.3,
+                        fontSize: 10,
+                        bold: true,
+                        color: 'FFFFFF',
+                        align: 'center',
+                        valign: 'middle',
+                        fontFace: 'Segoe UI'
+                    }));
+                    
+                    // 📄 결정사항 제목
+                    slide.addText(`${config.icon} ${decision.decision || '결정사항 없음'}`, safeSlideOptions({
+                        x: 0.8, y: yPos, w: 7.5, h: 0.5,
+                        fontSize: 16,
+                        bold: true,
+                        color: '2D3748',
+                        fontFace: 'Segoe UI'
+                    }));
+                    
+                    // 📈 영향도 설명
+                    if (decision.impact) {
+                        slide.addText(`영향도: ${decision.impact}`, safeSlideOptions({
+                            x: 0.8, y: yPos + 0.5, w: 7.5, h: 0.4,
+                            fontSize: 12,
+                            color: '4A5568',
+                            fontFace: 'Segoe UI'
+                        }));
+                    }
+                    
+                    // 📅 담당자/기한 정보 (있다면)
+                    if (decision.owner || decision.deadline) {
+                        const additionalInfo = [];
+                        if (decision.owner) additionalInfo.push(`담당: ${decision.owner}`);
+                        if (decision.deadline) additionalInfo.push(`기한: ${decision.deadline}`);
+                        
+                        slide.addText(additionalInfo.join(' | '), safeSlideOptions({
+                            x: 0.8, y: yPos + 0.8, w: 7.5, h: 0.3,
+                            fontSize: 10,
+                            color: '718096',
+                            fontFace: 'Segoe UI',
+                            italic: true
+                        }));
+                    }
+                    
+                } catch (decisionError) {
+                    console.error(`[결정사항 ${index + 1} 처리 오류]:`, decisionError);
+                }
+            });
+            
+            // 📊 요약 정보
+            slide.addText(`총 ${decisions.length}개 결정사항 확정`, safeSlideOptions({
+                x: 7, y: 6.5, w: 2.5, h: 0.4,
+                fontSize: 12,
+                color: 'C53030',
+                align: 'right',
+                fontFace: 'Segoe UI',
+                bold: true
+            }));
+            
+        } else {
+            // 🤷 결정사항 없음 표시
+            slide.addShape('rect', safeSlideOptions({
+                x: 2, y: 3, w: 6, h: 2,
+                fill: 'FFF5F5',
+                line: { color: 'FED7D7', width: 1 }
+            }));
+            
+            slide.addText('📝 이번 회의에서는\n구체적인 결정사항이 없었습니다', safeSlideOptions({
+                x: 2.5, y: 3.5, w: 5, h: 1,
+                fontSize: 16,
+                color: '9B2C2C',
+                align: 'center',
+                valign: 'middle',
+                fontFace: 'Segoe UI'
+            }));
+        }
+        
+    } catch (error) {
+        console.error('[결정사항 슬라이드 생성 오류]:', error);
+        slide.addText('❌ 결정사항 정보 로드 실패', safeSlideOptions({
+            x: 1, y: 3, w: 8, h: 1,
+            fontSize: 20,
+            color: 'E53E3E',
+            align: 'center',
+            fontFace: 'Segoe UI'
+        }));
+        
+        slide.addText('회의록을 다시 확인해주세요', safeSlideOptions({
+            x: 1, y: 4, w: 8, h: 0.6,
+            fontSize: 14,
+            color: '718096',
+            align: 'center',
+            fontFace: 'Segoe UI Light'
+        }));
+    }
+}
+
+function createActionsSlide(slide, data) {
+    try {
+        // ⚡ 동적인 헤더
+        slide.addText('⚡ Action Items', safeSlideOptions({
+            x: 0.5, y: 0.3, w: 9, h: 0.8,
+            fontSize: 32,
+            bold: true,
+            color: '1565C0',
+            fontFace: 'Segoe UI'
+        }));
+        
+        // 📋 명확한 목적 설명
+        slide.addText('회의 결과 실행해야 할 구체적인 후속 조치', safeSlideOptions({
+            x: 0.5, y: 1.1, w: 9, h: 0.5,
+            fontSize: 16,
+            color: '6C7B8A',
+            fontFace: 'Segoe UI Light'
+        }));
+        
+        // 🎨 액션 구분선
+        slide.addShape('rect', safeSlideOptions({
+            x: 0.5, y: 1.8, w: 9, h: 0.05,
+            fill: '1565C0'
+        }));
+        
+        // 📊 액션 아이템 처리
+        const actions = Array.isArray(data.content) ? data.content : [];
+        
+        if (actions.length > 0) {
+            try {
+                // 🎯 우선순위별 분류
+                const priorityGroups = {
+                    high: { items: [], color: 'E53E3E', icon: '🔥', label: '긴급' },
+                    medium: { items: [], color: 'F56500', icon: '⚡', label: '보통' },
+                    low: { items: [], color: '38A169', icon: '📋', label: '일반' }
+                };
+                
+                actions.forEach(action => {
+                    const priority = action.priority || 'medium';
+                    if (priorityGroups[priority]) {
+                        priorityGroups[priority].items.push(action);
+                    } else {
+                        priorityGroups.medium.items.push(action);
+                    }
+                });
+                
+                let currentY = 2.3;
+                
+                // 우선순위별로 표시
+                Object.entries(priorityGroups).forEach(([priority, group]) => {
+                    if (group.items.length > 0) {
+                        // 🏷️ 우선순위 섹션 헤더
+                        slide.addText(`${group.icon} ${group.label} (${group.items.length}개)`, safeSlideOptions({
+                            x: 0.5, y: currentY, w: 9, h: 0.4,
+                            fontSize: 14,
+                            bold: true,
+                            color: group.color,
+                            fontFace: 'Segoe UI'
+                        }));
+                        currentY += 0.5;
+                        
+                        // 📝 각 액션 아이템
+                        group.items.forEach((action, index) => {
+                            // 📦 액션 카드 배경
+                            slide.addShape('rect', safeSlideOptions({
+                                x: 0.5, y: currentY - 0.05, w: 9, h: 0.8,
+                                fill: priority === 'high' ? 'FFF5F5' : (priority === 'medium' ? 'FFFAF0' : 'F0FFF4'),
+                                line: { color: group.color, width: 1 }
+                            }));
+                            
+                            // ✅ 체크박스
+                            slide.addShape('rect', safeSlideOptions({
+                                x: 0.7, y: currentY + 0.1, w: 0.3, h: 0.3,
+                                fill: 'FFFFFF',
+                                line: { color: group.color, width: 2 }
+                            }));
+                            
+                            // 📄 액션 내용
+                            slide.addText(action.action || '액션 없음', safeSlideOptions({
+                                x: 1.2, y: currentY, w: 5, h: 0.4,
+                                fontSize: 14,
+                                bold: true,
+                                color: '2D3748',
+                                fontFace: 'Segoe UI'
+                            }));
+                            
+                            // 👤 담당자
+                            if (action.owner) {
+                                slide.addText(`👤 ${action.owner}`, safeSlideOptions({
+                                    x: 6.5, y: currentY, w: 1.5, h: 0.4,
+                                    fontSize: 11,
+                                    color: '4A5568',
+                                    fontFace: 'Segoe UI'
+                                }));
+                            }
+                            
+                            // 📅 기한
+                            if (action.deadline) {
+                                slide.addText(`📅 ${action.deadline}`, safeSlideOptions({
+                                    x: 8.2, y: currentY, w: 1.3, h: 0.4,
+                                    fontSize: 11,
+                                    color: '4A5568',
+                                    fontFace: 'Segoe UI'
+                                }));
+                            }
+                            
+                            // 📝 추가 설명 (있다면)
+                            if (action.description) {
+                                slide.addText(action.description, safeSlideOptions({
+                                    x: 1.2, y: currentY + 0.4, w: 7.5, h: 0.3,
+                                    fontSize: 10,
+                                    color: '718096',
+                                    fontFace: 'Segoe UI',
+                                    italic: true
+                                }));
+                            }
+                            
+                            currentY += 0.9;
+                        });
+                        
+                        currentY += 0.2; // 그룹 간 간격
+                    }
+                });
+                
+                // 📊 액션 요약
+                slide.addText(`총 ${actions.length}개 액션 아이템`, safeSlideOptions({
+                    x: 7, y: 6.5, w: 2.5, h: 0.4,
+                    fontSize: 12,
+                    color: '1565C0',
+                    align: 'right',
+                    fontFace: 'Segoe UI',
+                    bold: true
+                }));
+                
+                console.log(`[액션 아이템 생성 성공] ${actions.length}개 아이템`);
+                
+            } catch (actionError) {
+                console.error('[액션 아이템 처리 오류]:', actionError);
+                
+                // 🔄 단순 리스트 폴백
+                slide.addText('📝 액션 아이템 목록', safeSlideOptions({
+                    x: 0.5, y: 2.3, w: 9, h: 0.5,
+                    fontSize: 16,
+                    bold: true,
+                    color: '2D3748',
+                    fontFace: 'Segoe UI'
+                }));
+                
+                actions.forEach((action, index) => {
+                    slide.addText(`${index + 1}. ${action.action || '액션 없음'} (담당: ${action.owner || '미정'})`, safeSlideOptions({
+                        x: 0.7, y: 3 + (index * 0.5), w: 8.5, h: 0.4,
+                        fontSize: 12,
+                        color: '4A5568',
+                        fontFace: 'Segoe UI'
+                    }));
+                });
+            }
+        } else {
+            // 📭 액션 아이템 없음
+            slide.addShape('rect', safeSlideOptions({
+                x: 2, y: 3, w: 6, h: 2,
+                fill: 'F0F9FF',
+                line: { color: 'BEE3F8', width: 1 }
+            }));
+            
+            slide.addText('📭 실행할 액션 아이템이\n아직 등록되지 않았습니다', safeSlideOptions({
+                x: 2.5, y: 3.5, w: 5, h: 1,
+                fontSize: 16,
+                color: '2B6CB0',
+                align: 'center',
+                valign: 'middle',
+                fontFace: 'Segoe UI'
+            }));
+        }
+        
+    } catch (error) {
+        console.error('[액션 슬라이드 생성 오류]:', error);
+        slide.addText('❌ 액션 아이템 정보 로드 실패', safeSlideOptions({
+            x: 1, y: 3, w: 8, h: 1,
+            fontSize: 20,
+            color: 'E53E3E',
+            align: 'center',
+            fontFace: 'Segoe UI'
+        }));
+        
+        slide.addText('회의록을 다시 확인해주세요', safeSlideOptions({
+            x: 1, y: 4, w: 8, h: 0.6,
+            fontSize: 14,
+            color: '718096',
+            align: 'center',
+            fontFace: 'Segoe UI Light'
+        }));
+    }
+}
+
+function createContentSlide(slide, data) {
+    try {
+        // 제목
+        slide.addText(data.title || '내용', safeSlideOptions({
+            x: 0.5, y: 0.5, w: 9, h: 1,
+            fontSize: 24,
+            bold: true,
+            color: '4472C4',
+            fontFace: 'Segoe UI'
+        }));
+        
+        // 내용
+        if (Array.isArray(data.content)) {
+            data.content.forEach((item, index) => {
+                if (item && typeof item === 'string') {
+                    slide.addText(`• ${item}`, safeSlideOptions({
+                        x: 0.7, y: 2 + (index * 0.6), w: 8.5, h: 0.5,
+                        fontSize: 16,
+                        color: '333333',
+                        fontFace: 'Segoe UI'
+                    }));
+                }
+            });
+        } else if (data.content) {
+            slide.addText(String(data.content), safeSlideOptions({
+                x: 0.5, y: 2, w: 9, h: 4,
+                fontSize: 16,
+                color: '333333',
+                fontFace: 'Segoe UI',
+                valign: 'top'
+            }));
+        } else {
+            slide.addText('내용이 없습니다.', safeSlideOptions({
+                x: 1, y: 2.5, w: 8, h: 0.6,
+                fontSize: 16,
+                color: '666666',
+                fontFace: 'Segoe UI',
+                align: 'center'
+            }));
+        }
+        
+    } catch (error) {
+        console.error('[콘텐츠 슬라이드 생성 오류]:', error);
+        slide.addText('콘텐츠를 불러올 수 없습니다', safeSlideOptions({
+            x: 1, y: 2, w: 8, h: 1,
+            fontSize: 16,
+            color: '333333',
+            fontFace: 'Segoe UI'
+        }));
+    }
+}
+
+function createTableInSlide(slide, tableData, yPosition) {
+    if (!tableData) return;
+    
+    try {
+        // 테이블 데이터 정규화 및 검증
+        let normalizedTableData = normalizeTableData(tableData);
+        
+        if (!Array.isArray(normalizedTableData) || normalizedTableData.length === 0) {
+            console.log('[테이블 생성 경고] 유효하지 않은 테이블 데이터:', tableData);
+            return;
+        }
+        
+        // 각 행이 배열인지 확인하고 수정
+        normalizedTableData = normalizedTableData.map(row => {
+            if (Array.isArray(row)) {
+                return row.map(cell => String(cell || ''));
+            } else if (typeof row === 'object' && row !== null) {
+                return Object.values(row).map(cell => String(cell || ''));
+            } else {
+                return [String(row || '')];
+            }
+        });
+        
+        // 최소 1개 행이 있는지 확인
+        if (normalizedTableData.length === 0) {
+            console.log('[테이블 생성 경고] 빈 테이블 데이터');
+            return;
+        }
+        
+        // 최대한 단순한 테이블 옵션 (PptxGenJS 안전성 최우선)
+        const safeTableOptions = {
+            x: 0.5, 
+            y: yPosition, 
+            w: 9, 
+            fontSize: 11,
+            fontFace: 'Segoe UI',
+            fill: 'F8F9FA',  // 단순 문자열
+            color: '333333', // 단순 문자열
+            margin: 0.1,
+            valign: 'middle',
+            align: 'left'
+            // border, shadow 등 복잡한 속성은 모두 제거
+        };
+        
+        slide.addTable(normalizedTableData, safeTableOptions);
+        
+        console.log(`[테이블 생성 성공] ${normalizedTableData.length}행 테이블 생성됨`);
+        
+    } catch (error) {
+        console.error('[테이블 생성 오류]:', error);
+        console.log('[원본 테이블 데이터]:', tableData);
+        
+        // 폴백 1: 최소한의 옵션으로 테이블 재시도
+        try {
+            console.log('[테이블 폴백 1] 최소 옵션으로 테이블 재생성 시도');
+            const fallbackOptions = {
+                x: 0.5,
+                y: yPosition,
+                w: 9
+            };
+            slide.addTable(normalizedTableData, fallbackOptions);
+            console.log('[테이블 폴백 1 성공] 최소 옵션으로 테이블 생성됨');
+            return;
+        } catch (fallbackError) {
+            console.error('[테이블 폴백 1 실패]:', fallbackError);
+        }
+        
+        // 폴백 2: 간단한 텍스트로 표시
+        try {
+            const textContent = normalizedTableData.map(row => 
+                Array.isArray(row) ? row.join(' | ') : String(row)
+            ).join('\n');
+            
+            slide.addText(`📊 테이블 데이터:\n${textContent}`, {
+                x: 0.5, 
+                y: yPosition, 
+                w: 9, 
+                h: Math.min(3, 0.5 + normalizedTableData.length * 0.2),
+                fontSize: 10,
+                color: '333333',
+                fontFace: 'Segoe UI',
+                fill: 'F8F9FA',
+                wrap: true
+            });
+            console.log('[테이블 폴백 2 성공] 텍스트 형태로 표시됨');
+        } catch (textError) {
+            console.error('[테이블 폴백 2 실패]:', textError);
+            
+            // 최종 폴백: 오류 메시지만 표시
+            slide.addText('⚠️ 테이블 데이터 처리 중 오류가 발생했습니다.', {
+                x: 0.5, 
+                y: yPosition, 
+                w: 9, 
+                h: 0.5,
+                fontSize: 12,
+                color: 'D32F2F',
+                fontFace: 'Segoe UI'
+            });
+        }
+    }
+}
+
+// 색상 값 안전 처리 함수 (극강화 버전)
+// 간소화된 슬라이드 옵션 처리 (색상 제거)
+function safeSlideOptions(options) {
+    // 색상 관련 속성 제거하고 기본 옵션만 반환
+    if (!options || typeof options !== 'object') {
+        return {};
+    }
+    
+    const cleaned = { ...options };
+    // 색상 관련 속성들 제거
+    delete cleaned.color;
+    delete cleaned.fill;
+    delete cleaned.background;
+    delete cleaned.border;
+    
+    return cleaned;
+}
+
+// 테이블 데이터 정규화 함수
+function normalizeTableData(rawData) {
+    if (!rawData) return [];
+    
+    // 이미 배열인 경우
+    if (Array.isArray(rawData)) {
+        return rawData;
+    }
+    
+    // 문자열인 경우 파싱 시도
+    if (typeof rawData === 'string') {
+        try {
+            // JSON 문자열일 가능성
+            const parsed = JSON.parse(rawData);
+            if (Array.isArray(parsed)) return parsed;
+            
+            // CSV 형태 문자열일 가능성  
+            const lines = rawData.split('\n').filter(line => line.trim());
+            return lines.map(line => line.split(',').map(cell => cell.trim()));
+            
+        } catch {
+            // 단순 텍스트로 처리
+            return [['내용', rawData]];
+        }
+    }
+    
+    // 객체인 경우
+    if (typeof rawData === 'object' && rawData !== null) {
+        // 객체의 키-값을 테이블로 변환
+        const entries = Object.entries(rawData);
+        if (entries.length > 0) {
+            return [['항목', '내용'], ...entries];
+        }
+    }
+    
+    return [];
+}
+
+// ===================================================================================
+// Express 라우트 설정
 // ===================================================================================
 app.use(express.static('public'));
+
+// Word 문서 생성 함수
+function createWordDocument(meetingData) {
+    try {
+        console.log('[Word 생성] 시작');
+        
+        // 회의록 데이터 파싱
+        const parsedData = parseMeetingMinutes(meetingData);
+        
+        // Word 문서 생성
+        const doc = new Document({
+            creator: "AI 회의록 시스템",
+            title: parsedData.title || "회의록",
+            description: "AI가 자동 생성한 회의록",
+            styles: {
+                paragraphStyles: [
+                    {
+                        id: "Normal",
+                        name: "Normal",
+                        basedOn: "Normal",
+                        next: "Normal",
+                        run: {
+                            font: "맑은 고딕",
+                            size: 22
+                        },
+                        paragraph: {
+                            spacing: { after: 120 }
+                        }
+                    },
+                    {
+                        id: "Heading1",
+                        name: "Heading 1",
+                        basedOn: "Normal",
+                        next: "Normal",
+                        run: {
+                            font: "맑은 고딕",
+                            size: 32,
+                            bold: true,
+                            color: "2F4F4F"
+                        },
+                        paragraph: {
+                            spacing: { before: 240, after: 120 }
+                        }
+                    },
+                    {
+                        id: "Heading2",
+                        name: "Heading 2", 
+                        basedOn: "Normal",
+                        next: "Normal",
+                        run: {
+                            font: "맑은 고딕",
+                            size: 28,
+                            bold: true,
+                            color: "4682B4"
+                        },
+                        paragraph: {
+                            spacing: { before: 200, after: 100 }
+                        }
+                    }
+                ]
+            },
+            sections: [{
+                properties: {},
+                children: generateWordContent(parsedData)
+            }]
+        });
+        
+        console.log('[Word 생성] 완료');
+        return doc;
+        
+    } catch (error) {
+        console.error('[Word 생성 오류]:', error);
+        return createSimpleWordDocument(meetingData);
+    }
+}
+
+// 회의록 마크다운 파싱 함수
+function parseMeetingMinutes(meetingData) {
+    try {
+        // 회의록 타이틀과 본문 분리
+        const lines = meetingData.split('\n').filter(line => line.trim());
+        
+        let title = "회의록";
+        let content = [];
+        let currentSection = null;
+        
+        for (let line of lines) {
+            line = line.trim();
+            
+            // 제목 추출 (마크다운 제거)
+            if (line.includes('회의록') && title === "회의록") {
+                title = cleanMarkdownForHeading(line.replace(/[#\-*]/g, ''));
+                continue;
+            }
+            
+            // 헤딩 레벨 감지 (마크다운 제거)
+            if (line.startsWith('##')) {
+                currentSection = {
+                    type: 'heading2',
+                    text: cleanMarkdownForHeading(line.replace(/^##\s*/, '')),
+                    content: []
+                };
+                content.push(currentSection);
+            } else if (line.startsWith('#')) {
+                currentSection = {
+                    type: 'heading1',
+                    text: cleanMarkdownForHeading(line.replace(/^#\s*/, '')),
+                    content: []
+                };
+                content.push(currentSection);
+            } else if (line.startsWith('*') || line.startsWith('-')) {
+                // 목록 아이템
+                const listItem = {
+                    type: 'listItem',
+                    text: line.replace(/^[\*\-]\s*/, '').trim()
+                };
+                
+                if (currentSection) {
+                    currentSection.content.push(listItem);
+                } else {
+                    content.push(listItem);
+                }
+            } else if (line.length > 5) {
+                // 일반 텍스트
+                const paragraph = {
+                    type: 'paragraph',
+                    text: line
+                };
+                
+                if (currentSection) {
+                    currentSection.content.push(paragraph);
+                } else {
+                    content.push(paragraph);
+                }
+            }
+        }
+        
+        return { title, content };
+        
+    } catch (error) {
+        console.error('[회의록 파싱 오류]:', error);
+        return {
+            title: "회의록",
+            content: [{
+                type: 'paragraph',
+                text: meetingData
+            }]
+        };
+    }
+}
+
+// 헤딩/제목용 마크다운 제거 함수 (서식 없이 깔끔한 텍스트만)
+function cleanMarkdownForHeading(text) {
+    return text
+        .replace(/^#{1,6}\s*/g, '')                // # ## ### 등 헤딩 마크다운 제거
+        .replace(/\**(논의\s*배경)\**/g, '논의 배경')   // 논의 배경 주변 * 모두 제거
+        .replace(/\**(핵심\s*내용)\**/g, '핵심 내용')   // 핵심 내용 주변 * 모두 제거
+        .replace(/\**(논의\s*결과)\**/g, '논의 결과')   // 논의 결과 주변 * 모두 제거
+        .replace(/\**(배경)\**/g, '배경')             // 배경 주변 * 모두 제거
+        .replace(/\**(내용)\**/g, '내용')             // 내용 주변 * 모두 제거
+        .replace(/\**(결과)\**/g, '결과')             // 결과 주변 * 모두 제거
+        .replace(/\**(\w+)\**(?=\s*[:：])/g, '$1')    // 단어: 주변 * 모두 제거
+        .replace(/\**(\w+)\**(?=\s*$)/g, '$1')       // 문장 끝 단어 주변 * 모두 제거
+        .replace(/\*\*\*(.+?)\*\*\*/g, '$1')         // ***text*** → text
+        .replace(/\*\*(.+?)\*\*/g, '$1')             // **text** → text
+        .replace(/\*(.+?)\*/g, '$1')                 // *text* → text
+        .replace(/`(.+?)`/g, '$1')                   // `text` → text
+        .replace(/~~(.+?)~~/g, '$1')                 // ~~text~~ → text
+        .replace(/\*+$/g, '')                        // 끝에 붙은 * 제거
+        .trim();
+}
+
+// 마크다운을 Word 서식으로 변환하는 함수
+function parseMarkdownToWordRuns(text) {
+    const runs = [];
+    let currentPos = 0;
+    
+    // 먼저 특정 패턴의 * 제거 (모든 조합 처리)
+    text = text
+        .replace(/\**(논의\s*배경)\**/g, '논의 배경')   // 논의 배경 주변 * 모두 제거
+        .replace(/\**(핵심\s*내용)\**/g, '핵심 내용')   // 핵심 내용 주변 * 모두 제거
+        .replace(/\**(논의\s*결과)\**/g, '논의 결과')   // 논의 결과 주변 * 모두 제거
+        .replace(/\**(배경)\**/g, '배경')             // 배경 주변 * 모두 제거
+        .replace(/\**(내용)\**/g, '내용')             // 내용 주변 * 모두 제거
+        .replace(/\**(결과)\**/g, '결과')             // 결과 주변 * 모두 제거
+        .replace(/\**(\w+)\**(?=\s*[:：])/g, '$1')    // 단어: 주변 * 모두 제거
+        .replace(/\**(\w+)\**(?=\s*$)/g, '$1');      // 문장 끝 단어 주변 * 모두 제거
+    
+    // 마크다운 패턴들 (우선순위 순서로 정렬 - 헤딩 추가)
+    const patterns = [
+        { regex: /^######\s*(.+)$/gm, bold: true, size: 20 }, // ###### h6
+        { regex: /^#####\s*(.+)$/gm, bold: true, size: 22 }, // ##### h5  
+        { regex: /^####\s*(.+)$/gm, bold: true, size: 24 }, // #### h4
+        { regex: /^###\s*(.+)$/gm, bold: true, size: 26 }, // ### h3
+        { regex: /^##\s*(.+)$/gm, bold: true, size: 28 }, // ## h2
+        { regex: /^#\s*(.+)$/gm, bold: true, size: 32 }, // # h1
+        { regex: /\*\*\*(.+?)\*\*\*/g, bold: true, italic: true }, // ***bold italic***
+        { regex: /\*\*(.+?)\*\*/g, bold: true }, // **bold**
+        { regex: /\*(.+?)\*/g, italic: true }, // *italic*
+        { regex: /`(.+?)`/g, color: "D73502", font: "Consolas" }, // `code`
+        { regex: /~~(.+?)~~/g, strike: true }, // ~~strikethrough~~
+    ];
+    
+    // 모든 매치를 찾아서 위치별로 정렬
+    const matches = [];
+    for (const pattern of patterns) {
+        let match;
+        pattern.regex.lastIndex = 0; // regex 상태 초기화
+        while ((match = pattern.regex.exec(text)) !== null) {
+            matches.push({
+                start: match.index,
+                end: match.index + match[0].length,
+                content: match[1],
+                style: pattern
+            });
+        }
+    }
+    
+    // 겹치지 않는 매치들만 선택 (시작 위치 순으로 정렬)
+    matches.sort((a, b) => a.start - b.start);
+    const validMatches = [];
+    for (const match of matches) {
+        const isOverlapping = validMatches.some(vm => 
+            (match.start >= vm.start && match.start < vm.end) ||
+            (match.end > vm.start && match.end <= vm.end)
+        );
+        if (!isOverlapping) {
+            validMatches.push(match);
+        }
+    }
+    
+    // TextRun 배열 생성
+    for (const match of validMatches) {
+        // 매치 이전의 일반 텍스트 추가
+        if (currentPos < match.start) {
+            const normalText = text.substring(currentPos, match.start);
+            if (normalText.trim()) {
+                runs.push(new TextRun({
+                    text: normalText,
+                    font: "맑은 고딕",
+                    size: 22
+                }));
+            }
+        }
+        
+        // 스타일이 적용된 텍스트 추가
+        const styledRun = {
+            text: match.content,
+            font: match.style.font || "맑은 고딕",
+            size: match.style.size || 22  // 헤딩 크기 또는 기본 크기
+        };
+        
+        if (match.style.bold) styledRun.bold = true;
+        if (match.style.italic) styledRun.italics = true;
+        if (match.style.strike) styledRun.strike = true;
+        if (match.style.color) styledRun.color = match.style.color;
+        
+        runs.push(new TextRun(styledRun));
+        currentPos = match.end;
+    }
+    
+    // 남은 일반 텍스트 추가
+    if (currentPos < text.length) {
+        const remainingText = text.substring(currentPos);
+        if (remainingText.trim()) {
+            runs.push(new TextRun({
+                text: remainingText,
+                font: "맑은 고딕",
+                size: 22
+            }));
+        }
+    }
+    
+    // 아무 매치가 없으면 전체를 일반 텍스트로
+    if (runs.length === 0) {
+        runs.push(new TextRun({
+            text: text,
+            font: "맑은 고딕",
+            size: 22
+        }));
+    }
+    
+    return runs;
+}
+
+// Word 문서 내용 생성
+function generateWordContent(parsedData) {
+    const children = [];
+    
+    // 제목 추가 (마크다운 제거)
+    children.push(new Paragraph({
+        text: cleanMarkdownForHeading(parsedData.title),
+        heading: HeadingLevel.TITLE,
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 280 }
+    }));
+    
+    // 생성 정보 추가
+    children.push(new Paragraph({
+        children: [
+            new TextRun({
+                text: `생성일시: ${new Date().toLocaleString('ko-KR')}`,
+                font: "맑은 고딕",
+                size: 20,
+                color: "666666"
+            })
+        ],
+        alignment: AlignmentType.RIGHT,
+        spacing: { after: 200 }
+    }));
+    
+    // 구분선 (적절한 길이로 조정)
+    children.push(new Paragraph({
+        text: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 200 }
+    }));
+    
+    // 내용 추가
+    for (const item of parsedData.content) {
+        switch (item.type) {
+            case 'heading1':
+                children.push(new Paragraph({
+                    text: cleanMarkdownForHeading(item.text),
+                    heading: HeadingLevel.HEADING_1,
+                    spacing: { before: 200, after: 100 }
+                }));
+                
+                // 서브 콘텐츠 추가
+                for (const subItem of item.content || []) {
+                    children.push(...generateContentParagraph(subItem));
+                }
+                break;
+                
+            case 'heading2':
+                children.push(new Paragraph({
+                    text: cleanMarkdownForHeading(item.text),
+                    heading: HeadingLevel.HEADING_2,
+                    spacing: { before: 160, after: 80 }
+                }));
+                
+                // 서브 콘텐츠 추가
+                for (const subItem of item.content || []) {
+                    children.push(...generateContentParagraph(subItem));
+                }
+                break;
+                
+            default:
+                children.push(...generateContentParagraph(item));
+        }
+    }
+    
+    return children;
+}
+
+// 개별 컨텐츠 항목을 문단으로 변환
+function generateContentParagraph(item) {
+    switch (item.type) {
+        case 'listItem':
+            // 리스트 아이템에서 마크다운 처리
+            const listText = `• ${item.text}`;
+            const listRuns = parseMarkdownToWordRuns(listText);
+            return [new Paragraph({
+                children: listRuns,
+                indent: { left: 400 },
+                spacing: { after: 60 }
+            })];
+            
+        case 'paragraph':
+            // 일반 단락에서 마크다운 처리
+            const paragraphRuns = parseMarkdownToWordRuns(item.text);
+            return [new Paragraph({
+                children: paragraphRuns,
+                spacing: { after: 80 }
+            })];
+            
+        default:
+            // 기타 타입에서도 마크다운 처리
+            const text = item.text || String(item);
+            const defaultRuns = parseMarkdownToWordRuns(text);
+            return [new Paragraph({
+                children: defaultRuns,
+                spacing: { after: 80 }
+            })];
+    }
+}
+
+// 간단한 Word 문서 생성 (파싱 실패 시 폴백)
+function createSimpleWordDocument(meetingData) {
+    console.log('[Word 간단 생성] 시작');
+    
+    // 긴 텍스트를 문단별로 나누어 처리
+    const paragraphs = meetingData.split('\n').filter(line => line.trim());
+    const children = [
+        new Paragraph({
+            text: "회의록",
+            heading: HeadingLevel.TITLE,
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 280 }
+        }),
+        new Paragraph({
+            children: [
+                new TextRun({
+                    text: `생성일시: ${new Date().toLocaleString('ko-KR')}`,
+                    size: 20,
+                    color: "666666"
+                })
+            ],
+            alignment: AlignmentType.RIGHT,
+            spacing: { after: 200 }
+        }),
+        new Paragraph({
+            text: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 200 }
+        })
+    ];
+    
+    // 각 문단을 마크다운 처리하여 추가
+    for (const paragraph of paragraphs) {
+        if (paragraph.trim()) {
+            children.push(new Paragraph({
+                children: parseMarkdownToWordRuns(paragraph),
+                spacing: { after: 80 }
+            }));
+        }
+    }
+    
+    const doc = new Document({
+        creator: "AI 회의록 시스템",
+        title: "회의록",
+        sections: [{
+            properties: {},
+            children: children
+        }]
+    });
+    
+    return doc;
+}
+
+// PPT 파일 다운로드 엔드포인트
+app.get('/download-ppt/:filename', (req, res) => {
+    const fileName = req.params.filename;
+    const filePath = path.join(__dirname, 'temp', fileName);
+    
+    // 보안 검증: 파일명이 올바른 형식인지 확인
+    if (!fileName.match(/^회의록_\d{4}-\d{2}-\d{2}_\d+\.pptx$/)) {
+        return res.status(400).send('잘못된 파일명입니다.');
+    }
+    
+    // 파일 존재 여부 확인
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).send('파일을 찾을 수 없습니다. 파일이 만료되었거나 삭제되었을 수 있습니다.');
+    }
+    
+    try {
+        // 파일 다운로드 헤더 설정
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`);
+        
+        // 파일 스트림으로 전송
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.pipe(res);
+        
+        fileStream.on('end', () => {
+            console.log(`[파일 다운로드 완료] ${fileName}`);
+        });
+        
+        fileStream.on('error', (error) => {
+            console.error('[파일 다운로드 오류]:', error);
+            res.status(500).send('파일 다운로드 중 오류가 발생했습니다.');
+        });
+        
+    } catch (error) {
+        console.error('[PPT 다운로드 오류]:', error);
+        res.status(500).send('파일 다운로드 중 오류가 발생했습니다.');
+    }
+});
+
+// Word 파일 다운로드 엔드포인트
+app.get('/download-word/:filename', (req, res) => {
+    const fileName = req.params.filename;
+    const filePath = path.join(__dirname, 'temp', fileName);
+    
+    // 보안 검증: 파일명이 올바른 형식인지 확인
+    if (!fileName.match(/^회의록_\d{4}-\d{2}-\d{2}_\d+\.docx$/)) {
+        return res.status(400).send('잘못된 파일명입니다.');
+    }
+    
+    // 파일 존재 여부 확인
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).send('파일을 찾을 수 없습니다. 파일이 만료되었거나 삭제되었을 수 있습니다.');
+    }
+    
+    try {
+        // 파일 다운로드 헤더 설정
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(fileName)}"`);
+        
+        // 파일 스트림으로 전송
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.pipe(res);
+        
+        fileStream.on('end', () => {
+            console.log(`[Word 다운로드 완료] ${fileName}`);
+        });
+        
+        fileStream.on('error', (error) => {
+            console.error('[Word 다운로드 오류]:', error);
+            res.status(500).send('파일 다운로드 중 오류가 발생했습니다.');
+        });
+        
+    } catch (error) {
+        console.error('[Word 다운로드 오류]:', error);
+        res.status(500).send('파일 다운로드 중 오류가 발생했습니다.');
+    }
+});
+
+// ===================================================================================
+// Socket.IO 연결 핸들링
+// ===================================================================================
 
 io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
     console.log('새로운 사용자가 연결되었습니다.');
@@ -966,6 +3902,303 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
         }
     });
 
+    // PPT 생성 요청 처리 (완전 강화 버전)
+    socket.on('generate_ppt', async () => {
+        const fromUser = users.get(socket.id);
+        if (!fromUser) return;
+
+        console.log(`[PPT 생성] ${fromUser.username}이(가) PPT 생성을 요청했습니다.`);
+        
+        // 전체 PPT 생성 과정을 안전하게 감쌈
+        let pptStructure = null;
+        let pptx = null;
+        let fileName = null;
+        let filePath = null;
+        let meetingData = null; // 상위 스코프로 이동
+        
+        try {
+            // 1단계: 회의록 데이터 검증
+            socket.emit('ppt_progress', { stage: 'analyzing', message: 'AI가 회의록을 분석하고 있습니다...' });
+            
+            const meetingHistory = conversationContext.getFullHistorySnapshot();
+            meetingData = meetingHistory.map(m => `${m.from}: ${m.content}`).join('\n');
+            
+            if (meetingData.length < 50) {
+                socket.emit('ppt_error', { message: '회의록 내용이 너무 짧습니다. 더 많은 대화 후 다시 시도해주세요.' });
+                return;
+            }
+            
+            console.log(`[PPT 1단계] 회의록 데이터 준비 완료 (${meetingData.length}자)`);
+            
+        } catch (error) {
+            console.error('[PPT 1단계 오류] 회의록 데이터 준비 실패:', error);
+            socket.emit('ppt_error', { message: '회의록 데이터를 불러오는 중 오류가 발생했습니다.' });
+            return;
+        }
+        
+        try {
+            // 2단계: AI 구조 생성
+            socket.emit('ppt_progress', { stage: 'structuring', message: '프레젠테이션 구조를 설계하고 있습니다...' });
+            
+            pptStructure = await ErrorHandler.handleAsyncOperation(
+                async () => await generatePptStructure(meetingData),
+                'PPT 구조 생성',
+                null
+            );
+            
+            if (!pptStructure || !pptStructure.slides || pptStructure.slides.length === 0) {
+                throw new Error('PPT 구조 생성 실패');
+            }
+            
+            console.log(`[PPT 2단계] 구조 생성 완료 (${pptStructure.slides.length}개 슬라이드)`);
+            
+        } catch (error) {
+            console.error('[PPT 2단계 오류] 구조 생성 실패:', error);
+            
+            // 폴백: 기본 구조 사용
+            console.log('[PPT 2단계 폴백] 기본 구조로 PPT 생성 시도');
+            pptStructure = getDefaultPptStructure();
+            socket.emit('ppt_progress', { stage: 'structuring', message: '기본 구조로 프레젠테이션을 생성합니다...' });
+        }
+        
+        try {
+            // 3단계: 통합 PPT 생성 시스템 사용
+            socket.emit('ppt_progress', { stage: 'creating', message: '통합 시스템으로 PPT를 생성하고 있습니다...' });
+            
+            const pptGenerator = new UnifiedPPTGenerator();
+            pptx = await pptGenerator.generatePPT(meetingData, pptStructure);
+            
+            if (!pptx) {
+                throw new Error('PPT 객체 생성 실패');
+            }
+            
+            console.log(`[PPT 3단계] 통합 PPT 생성 시스템으로 생성 완료`);
+            
+        } catch (error) {
+            console.error('[PPT 3단계 오류] PPT 객체 생성 실패:', error);
+            socket.emit('ppt_error', { message: 'PPT 생성 중 오류가 발생했습니다. 단순한 버전으로 재시도합니다.' });
+            return;
+        }
+        
+        try {
+            // 4단계: 파일 저장 (완전 강화된 방식)
+            socket.emit('ppt_progress', { stage: 'saving', message: '파일을 저장하고 있습니다...' });
+            
+            // 파일명 및 경로 설정
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+            fileName = `회의록_${timestamp}_${Date.now()}.pptx`;
+            filePath = path.join(__dirname, 'temp', fileName);
+            
+            // temp 디렉토리가 없으면 생성
+            const tempDir = path.join(__dirname, 'temp');
+            if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+            }
+            
+            console.log(`[PPT 4단계] 파일 저장 시도: ${fileName}`);
+            
+            // 1차 시도: 최신 PptxGenJS API 사용
+            let saveSuccess = false;
+            try {
+                await pptx.writeFile({
+                    fileName: filePath,
+                    compression: true
+                });
+                saveSuccess = true;
+                console.log(`[PPT 4단계] 최신 API로 파일 저장 완료: ${fileName}`);
+            } catch (writeError) {
+                console.error('[PPT 4단계 오류] 최신 API 저장 실패:', writeError);
+                
+                // 2차 시도: 구 방식 API
+                try {
+                    console.log('[PPT 4단계 폴백] 구 방식으로 저장 시도');
+                    await pptx.writeFile(filePath);
+                    saveSuccess = true;
+                    console.log(`[PPT 4단계 폴백] 구 방식 저장 성공: ${fileName}`);
+                } catch (fallbackError) {
+                    console.error('[PPT 4단계 폴백 실패]:', fallbackError);
+                    
+                    // 3차 시도: 스트림 방식
+                    try {
+                        console.log('[PPT 4단계 최종시도] 스트림 방식으로 저장 시도');
+                        const buffer = await pptx.stream();
+                        fs.writeFileSync(filePath, buffer);
+                        saveSuccess = true;
+                        console.log(`[PPT 4단계 최종시도] 스트림 방식 저장 성공: ${fileName}`);
+                    } catch (streamError) {
+                        console.error('[PPT 4단계 최종시도 실패]:', streamError);
+                        // 모든 시도 실패
+                    }
+                }
+            }
+            
+            if (!saveSuccess) {
+                throw new Error('모든 파일 저장 방식이 실패했습니다');
+            }
+            
+        } catch (error) {
+            console.error('[PPT 4단계 전체 실패] 파일 저장 불가:', error);
+            socket.emit('ppt_error', { 
+                message: 'PPT 파일 저장 중 오류가 발생했습니다. 슬라이드 내용을 단순화해보세요.',
+                details: error.message 
+            });
+            return;
+        }
+        
+        try {
+            // 5단계: 완료 처리
+            console.log(`[PPT 생성 완료] 파일 저장됨: ${fileName}`);
+            
+            // 클라이언트에 다운로드 링크 전송
+            socket.emit('ppt_ready', { 
+                fileName: fileName,
+                downloadUrl: `/download-ppt/${fileName}`,
+                title: pptStructure.title || '회의 결과 보고서',
+                slideCount: pptStructure.slides ? pptStructure.slides.length : 0,
+                fileSize: fs.existsSync(filePath) ? Math.round(fs.statSync(filePath).size / 1024) + 'KB' : '알 수 없음'
+            });
+            
+            // 1시간 후 임시 파일 자동 삭제
+            setTimeout(() => {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                        console.log(`[파일 정리] 임시 PPT 파일 삭제: ${fileName}`);
+                    }
+                } catch (error) {
+                    console.error(`[파일 정리 오류] ${fileName} 삭제 실패:`, error);
+                }
+            }, 60 * 60 * 1000); // 1시간
+            
+        } catch (error) {
+            console.error('[PPT 5단계 오류] 완료 처리 실패:', error);
+            socket.emit('ppt_error', { message: 'PPT 생성은 완료되었으나 다운로드 링크 생성에 실패했습니다.' });
+        }
+    });
+
+    // Word 생성 요청 처리
+    socket.on('generate_word', async () => {
+        const fromUser = users.get(socket.id);
+        if (!fromUser) return;
+
+        console.log(`[Word 생성] ${fromUser.username}이(가) Word 생성을 요청했습니다.`);
+        
+        let fileName = null;
+        let filePath = null;
+        let meetingData = null;
+        let doc = null;
+        
+        try {
+            // 1단계: 회의록 데이터 준비
+            socket.emit('word_progress', { stage: 'preparing', message: '회의록 데이터를 준비하고 있습니다...' });
+            
+            // 별도 저장소에서 회의록 조회
+            if (meetingMinutesStorage.length === 0) {
+                socket.emit('word_error', { message: '생성된 회의록이 없습니다. 먼저 회의록을 생성해주세요.' });
+                return;
+            }
+            
+            // 가장 최근 회의록 사용
+            const latestMeeting = meetingMinutesStorage[meetingMinutesStorage.length - 1];
+            meetingData = latestMeeting.content;
+            
+            if (!meetingData || meetingData.length < 20) {
+                socket.emit('word_error', { message: '회의록 내용이 너무 짧습니다.' });
+                return;
+            }
+            
+            console.log(`[Word 1단계] 회의록 데이터 준비 완료 (${meetingData.length}자)`);
+            
+        } catch (error) {
+            console.error('[Word 1단계 오류] 회의록 데이터 준비 실패:', error);
+            socket.emit('word_error', { message: '회의록 데이터를 불러오는 중 오류가 발생했습니다.' });
+            return;
+        }
+        
+        try {
+            // 2단계: Word 문서 생성
+            socket.emit('word_progress', { stage: 'converting', message: 'Word 문서로 변환하고 있습니다...' });
+            
+            doc = createWordDocument(meetingData);
+            if (!doc) {
+                throw new Error('Word 문서 생성 실패');
+            }
+            
+            console.log(`[Word 2단계] Word 문서 생성 완료`);
+            
+        } catch (error) {
+            console.error('[Word 2단계 오류] Word 문서 생성 실패:', error);
+            socket.emit('word_error', { message: 'Word 문서 생성 중 오류가 발생했습니다.' });
+            return;
+        }
+        
+        try {
+            // 3단계: 파일 저장
+            socket.emit('word_progress', { stage: 'saving', message: '파일을 저장하고 있습니다...' });
+            
+            // 파일명 및 경로 설정
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+            fileName = `회의록_${timestamp}_${Date.now()}.docx`;
+            filePath = path.join(__dirname, 'temp', fileName);
+            
+            // temp 디렉토리가 없으면 생성
+            const tempDir = path.join(__dirname, 'temp');
+            if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+            }
+            
+            console.log(`[Word 3단계] 파일 저장 시도: ${fileName}`);
+            
+            // Word 문서를 버퍼로 변환 후 파일로 저장
+            const buffer = await Packer.toBuffer(doc);
+            fs.writeFileSync(filePath, buffer);
+            
+            console.log(`[Word 3단계] 파일 저장 완료: ${fileName}`);
+            
+        } catch (error) {
+            console.error('[Word 3단계 오류] 파일 저장 실패:', error);
+            socket.emit('word_error', { 
+                message: 'Word 파일 저장 중 오류가 발생했습니다.',
+                details: error.message 
+            });
+            return;
+        }
+        
+        try {
+            // 4단계: 완료 처리
+            console.log(`[Word 생성 완료] 파일 저장됨: ${fileName}`);
+            
+            // 파일 크기 및 페이지 수 계산 (추정)
+            const fileSize = fs.existsSync(filePath) ? Math.round(fs.statSync(filePath).size / 1024) + 'KB' : '알 수 없음';
+            const estimatedPages = Math.ceil(meetingData.length / 3000); // 3000자당 1페이지로 추정
+            
+            // 클라이언트에 다운로드 링크 전송
+            socket.emit('word_ready', { 
+                fileName: fileName,
+                downloadUrl: `/download-word/${fileName}`,
+                title: "회의록",
+                pageCount: estimatedPages,
+                fileSize: fileSize
+            });
+            
+            // 1시간 후 임시 파일 자동 삭제
+            setTimeout(() => {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                        console.log(`[파일 정리] 임시 Word 파일 삭제: ${fileName}`);
+                    }
+                } catch (error) {
+                    console.error(`[파일 정리 오류] ${fileName} 삭제 실패:`, error);
+                }
+            }, 60 * 60 * 1000); // 1시간
+            
+        } catch (error) {
+            console.error('[Word 4단계 오류] 완료 처리 실패:', error);
+            socket.emit('word_error', { message: 'Word 생성은 완료되었으나 다운로드 링크 생성에 실패했습니다.' });
+        }
+    });
+
     socket.on(SOCKET_EVENTS.DISCONNECT, () => {
         const user = users.get(socket.id);
         if (user) {
@@ -1011,7 +4244,10 @@ async function startServer() {
 
         const prompt = `다음 대화의 핵심 주제를 한 문장으로 요약해줘.\n\n${history.slice(-20).map(m=>`${m.from}: ${m.content}`).join('\n')}`;
         try {
-            const result = await model.generateContent(prompt);
+            const result = await apiLimiter.executeAPICall(
+            async (prompt) => await model.generateContent(prompt),
+            prompt
+        );
             const summary = (await result.response).text().trim();
             conversationContext.setTopicSummary(summary);
         } catch (error) {
