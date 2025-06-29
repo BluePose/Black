@@ -2124,6 +2124,35 @@
             showWordError(data.message);
         });
 
+        // 마피아 게임 관련 소켓 이벤트 리스너
+        socket.on('mafia_start', (data) => {
+            startMafiaGameUI(data);
+        });
+
+        socket.on('mafia_end', () => {
+            endMafiaGameUI();
+        });
+
+        socket.on('mafia_vote', (data) => {
+            showVotingUI(data);
+        });
+
+        socket.on('mafia_game_end', (data) => {
+            showGameEndUI(data);
+        });
+
+        socket.on('mafia_ui_update', (data) => {
+            updateMafiaUI(data);
+        });
+
+        socket.on('mafia_voting_update', (data) => {
+            updateEndGameVoting(data);
+        });
+
+        socket.on('vote_confirmed', (data) => {
+            showVoteConfirmation(data.voteType);
+        });
+
         // PPT 생성 관련 함수들
         function generatePPT() {
             const pptBtns = document.querySelectorAll('.ppt-generate-btn');
@@ -2334,6 +2363,434 @@
                 closeWordModal();
             }
         });
+
+        // 마피아 게임 UI 함수들
+        let isMafiaMode = false;
+        let currentVotingData = null;
+
+        function startMafiaGameUI(data) {
+            isMafiaMode = true;
+            
+            // 배경 변경 (마피아 모드)
+            document.body.classList.add('mafia-mode');
+            
+            // 마피아 모드 배경 CSS 추가
+            if (!document.getElementById('mafia-style')) {
+                const style = document.createElement('style');
+                style.id = 'mafia-style';
+                style.textContent = `
+                    .mafia-mode {
+                        background: linear-gradient(135deg, #2c1810 0%, #1a0f0a 50%, #0f0704 100%);
+                        background-attachment: fixed;
+                    }
+                    .mafia-mode .container-wrapper {
+                        border: 2px solid #ff6b6b;
+                        box-shadow: 0 0 30px rgba(255, 107, 107, 0.3);
+                    }
+                    .voting-panel {
+                        position: fixed;
+                        bottom: 20px;
+                        left: 50%;
+                        transform: translateX(-50%);
+                        background: rgba(0,0,0,0.9);
+                        border: 2px solid #ff6b6b;
+                        border-radius: 15px;
+                        padding: 20px;
+                        display: none;
+                        z-index: 1000;
+                        min-width: 400px;
+                    }
+                    .voting-panel h3 {
+                        color: #ff6b6b;
+                        text-align: center;
+                        margin: 0 0 15px 0;
+                    }
+                    .voting-buttons {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+                        gap: 10px;
+                    }
+                    .vote-btn {
+                        background: #333;
+                        color: white;
+                        border: 1px solid #666;
+                        padding: 8px 12px;
+                        border-radius: 8px;
+                        cursor: pointer;
+                        transition: all 0.3s ease;
+                    }
+                    .vote-btn:hover {
+                        background: #ff6b6b;
+                        border-color: #ff6b6b;
+                    }
+                    .game-end-modal {
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        width: 100%;
+                        height: 100%;
+                        background: rgba(0,0,0,0.8);
+                        display: none;
+                        justify-content: center;
+                        align-items: center;
+                        z-index: 2000;
+                    }
+                    .game-end-content {
+                        background: rgba(15,15,15,0.95);
+                        border: 2px solid #ff6b6b;
+                        border-radius: 20px;
+                        padding: 30px;
+                        max-width: 600px;
+                        width: 90%;
+                        text-align: center;
+                        color: white;
+                        max-height: 80vh;
+                        overflow-y: auto;
+                    }
+                    .leaderboard {
+                        background: rgba(255,255,255,0.1);
+                        border-radius: 10px;
+                        padding: 20px;
+                        margin: 20px 0;
+                    }
+                    .leaderboard h3 {
+                        margin-top: 0;
+                        color: #ffd700;
+                    }
+                    .leaderboard-item {
+                        display: flex;
+                        justify-content: space-between;
+                        padding: 8px 0;
+                        border-bottom: 1px solid rgba(255,255,255,0.2);
+                    }
+                    .leaderboard-item:last-child {
+                        border-bottom: none;
+                    }
+                    .countdown-timer {
+                        font-size: 24px;
+                        color: #ff6b6b;
+                        margin: 20px 0;
+                        font-weight: bold;
+                    }
+                    .voting-section {
+                        margin: 20px 0;
+                    }
+                    .voting-buttons {
+                        display: flex;
+                        gap: 15px;
+                        justify-content: center;
+                        margin: 20px 0;
+                    }
+                    .vote-option-btn {
+                        background: #ff6b6b;
+                        color: white;
+                        border: none;
+                        padding: 15px 25px;
+                        border-radius: 10px;
+                        cursor: pointer;
+                        font-size: 16px;
+                        transition: all 0.3s ease;
+                        min-width: 120px;
+                    }
+                    .vote-option-btn:hover {
+                        background: #ff5252;
+                        transform: translateY(-2px);
+                    }
+                    .vote-option-btn:disabled {
+                        background: #666;
+                        cursor: not-allowed;
+                        transform: none;
+                    }
+                    .vote-status {
+                        background: rgba(255,255,255,0.1);
+                        border-radius: 8px;
+                        padding: 15px;
+                        margin: 15px 0;
+                    }
+                    .vote-bars {
+                        display: flex;
+                        height: 30px;
+                        border-radius: 15px;
+                        overflow: hidden;
+                        margin: 10px 0;
+                        background: rgba(255,255,255,0.1);
+                    }
+                    .vote-bar {
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        color: white;
+                        font-weight: bold;
+                        transition: all 0.3s ease;
+                    }
+                    .vote-bar.chat { background: #4CAF50; }
+                    .vote-bar.again { background: #FF9800; }
+                `;
+                document.head.appendChild(style);
+            }
+            
+            // 투표 패널 HTML 추가
+            if (!document.getElementById('voting-panel')) {
+                const votingPanel = document.createElement('div');
+                votingPanel.id = 'voting-panel';
+                votingPanel.className = 'voting-panel';
+                votingPanel.innerHTML = `
+                    <h3>🗳️ 누가 AI일까요?</h3>
+                    <div class="voting-buttons" id="voting-buttons"></div>
+                `;
+                document.body.appendChild(votingPanel);
+            }
+            
+            // 게임 종료 모달 HTML 추가
+            if (!document.getElementById('game-end-modal')) {
+                const gameEndModal = document.createElement('div');
+                gameEndModal.id = 'game-end-modal';
+                gameEndModal.className = 'game-end-modal';
+                gameEndModal.innerHTML = `
+                    <div class="game-end-content">
+                        <h2>🏆 마피아 게임 종료!</h2>
+                        <div id="game-end-summary"></div>
+                        <div id="leaderboard-container" class="leaderboard">
+                            <h3>🏅 최종 리더보드</h3>
+                            <div id="leaderboard-list"></div>
+                        </div>
+                        <div id="voting-section" class="voting-section">
+                            <div class="countdown-timer" id="countdown-timer">1:00</div>
+                            <h3>다음 행동을 선택해주세요!</h3>
+                            <div class="voting-buttons">
+                                <button class="vote-option-btn" id="vote-chat" onclick="voteEndGame('chat')">
+                                    🏠 채팅방 복귀
+                                </button>
+                                <button class="vote-option-btn" id="vote-again" onclick="voteEndGame('again')">
+                                    🎮 한번 더
+                                </button>
+                            </div>
+                            <div id="vote-status" class="vote-status">
+                                <div>현재 투표 현황</div>
+                                <div class="vote-bars" id="vote-bars">
+                                    <div class="vote-bar chat" id="chat-bar" style="width: 50%">채팅방 0표</div>
+                                    <div class="vote-bar again" id="again-bar" style="width: 50%">한번 더 0표</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(gameEndModal);
+            }
+            
+            console.log('마피아 게임 UI 시작:', data);
+        }
+
+        function endMafiaGameUI() {
+            isMafiaMode = false;
+            
+            // 배경 복원
+            document.body.classList.remove('mafia-mode');
+            
+            // 투표 패널 숨기기
+            const votingPanel = document.getElementById('voting-panel');
+            if (votingPanel) {
+                votingPanel.style.display = 'none';
+            }
+            
+            // 게임 종료 모달 숨기기
+            const gameEndModal = document.getElementById('game-end-modal');
+            if (gameEndModal) {
+                gameEndModal.style.display = 'none';
+            }
+            
+            // 카운트다운 타이머 정리
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+                countdownInterval = null;
+            }
+            
+            // 투표 상태 초기화
+            userHasVoted = false;
+            
+            console.log('마피아 게임 UI 종료');
+        }
+
+        function showVotingUI(data) {
+            if (!isMafiaMode) return;
+            
+            currentVotingData = data;
+            const votingPanel = document.getElementById('voting-panel');
+            const votingButtons = document.getElementById('voting-buttons');
+            
+            if (votingPanel && votingButtons && data.phase === 'start') {
+                // 투표 버튼들 생성
+                votingButtons.innerHTML = '';
+                data.participants.forEach(participant => {
+                    const button = document.createElement('button');
+                    button.className = 'vote-btn';
+                    button.textContent = participant;
+                    button.onclick = () => voteForParticipant(participant);
+                    votingButtons.appendChild(button);
+                });
+                
+                votingPanel.style.display = 'block';
+            }
+        }
+
+        function voteForParticipant(participant) {
+            if (!currentVotingData) return;
+            
+            // 투표 전송
+            socket.emit('mafia_vote', { votedFor: participant });
+            
+            // 투표 패널 숨기기
+            const votingPanel = document.getElementById('voting-panel');
+            if (votingPanel) {
+                votingPanel.style.display = 'none';
+            }
+            
+            console.log('투표 완료:', participant);
+        }
+
+        // 전역 변수
+        let countdownInterval = null;
+        let userHasVoted = false;
+
+        function showGameEndUI(data) {
+            const gameEndModal = document.getElementById('game-end-modal');
+            const gameEndSummary = document.getElementById('game-end-summary');
+            const leaderboardList = document.getElementById('leaderboard-list');
+            const votingSection = document.getElementById('voting-section');
+            
+            if (!gameEndModal) return;
+            
+            // 기본 정보 표시
+            gameEndSummary.innerHTML = `
+                <p>총 ${data.totalRounds}라운드 완료!</p>
+                <p>모든 참가자들 고생하셨습니다.</p>
+            `;
+            
+            // 리더보드 표시
+            if (data.leaderboard && data.leaderboard.length > 0) {
+                const sortedLeaderboard = data.leaderboard.sort((a, b) => b[1] - a[1]);
+                leaderboardList.innerHTML = sortedLeaderboard.map((entry, index) => {
+                    const [name, score] = entry;
+                    const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : '🏅';
+                    return `
+                        <div class="leaderboard-item">
+                            <span>${medal} ${name}</span>
+                            <span>${score}점</span>
+                        </div>
+                    `;
+                }).join('');
+            } else {
+                leaderboardList.innerHTML = '<div class="leaderboard-item">점수 정보가 없습니다.</div>';
+            }
+            
+            // 투표 섹션 표시/숨김
+            if (data.votingActive) {
+                votingSection.style.display = 'block';
+                userHasVoted = false;
+                
+                // 카운트다운 시작
+                if (data.votingDeadline) {
+                    startCountdown(data.votingDeadline);
+                }
+                
+                // 투표 현황 초기화
+                updateEndGameVoting({ chat: 0, again: 0, total: 0 });
+            } else {
+                votingSection.style.display = 'none';
+            }
+            
+            gameEndModal.style.display = 'flex';
+            console.log('게임 종료 UI 표시:', data);
+        }
+
+        function startCountdown(deadline) {
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+            
+            countdownInterval = setInterval(() => {
+                const now = Date.now();
+                const timeLeft = Math.max(0, deadline - now);
+                const seconds = Math.ceil(timeLeft / 1000);
+                const minutes = Math.floor(seconds / 60);
+                const remainingSeconds = seconds % 60;
+                
+                const timerElement = document.getElementById('countdown-timer');
+                if (timerElement) {
+                    timerElement.textContent = `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+                    
+                    if (timeLeft <= 0) {
+                        timerElement.textContent = '투표 마감!';
+                        clearInterval(countdownInterval);
+                    }
+                }
+            }, 100);
+        }
+
+        function voteEndGame(voteType) {
+            if (userHasVoted) return;
+            
+            socket.emit('mafia_end_vote', { voteType: voteType });
+            console.log('게임 종료 투표 전송:', voteType);
+        }
+
+        function showVoteConfirmation(voteType) {
+            userHasVoted = true;
+            
+            // 버튼 비활성화
+            const chatBtn = document.getElementById('vote-chat');
+            const againBtn = document.getElementById('vote-again');
+            
+            if (chatBtn) chatBtn.disabled = true;
+            if (againBtn) againBtn.disabled = true;
+            
+            // 선택한 버튼 하이라이트
+            const selectedBtn = document.getElementById(`vote-${voteType}`);
+            if (selectedBtn) {
+                selectedBtn.style.background = '#4CAF50';
+                selectedBtn.innerHTML += ' ✓';
+            }
+            
+            console.log('투표 확인됨:', voteType);
+        }
+
+        function updateEndGameVoting(data) {
+            const chatBar = document.getElementById('chat-bar');
+            const againBar = document.getElementById('again-bar');
+            
+            if (!chatBar || !againBar) return;
+            
+            const { chat, again, total } = data;
+            const chatPercent = total > 0 ? (chat / total) * 100 : 50;
+            const againPercent = total > 0 ? (again / total) * 100 : 50;
+            
+            chatBar.style.width = `${chatPercent}%`;
+            againBar.style.width = `${againPercent}%`;
+            
+            chatBar.textContent = `채팅방 ${chat}표`;
+            againBar.textContent = `한번 더 ${again}표`;
+            
+            // 바가 너무 작으면 텍스트 숨기기
+            if (chatPercent < 20) chatBar.textContent = '';
+            if (againPercent < 20) againBar.textContent = '';
+            
+            console.log('투표 현황 업데이트:', data);
+        }
+
+        function updateMafiaUI(data) {
+            if (data.type === 'new_round') {
+                console.log('새 라운드 UI 업데이트:', data);
+                
+                // 투표 UI 강제 닫기 처리
+                if (data.closeVotingUI === true) {
+                    const votingPanel = document.getElementById('voting-panel');
+                    if (votingPanel) {
+                        votingPanel.style.display = 'none';
+                        console.log('투표 UI 강제 닫기 완료 (새 라운드 시작)');
+                    }
+                }
+            }
+        }
 
         function updateUserList(users) {
             // Implementation of updateUserList function

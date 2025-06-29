@@ -532,6 +532,13 @@ class ConversationContext {
         this.topicSummary = summary;
         console.log(`[맥락 업데이트] 새로운 대화 주제: ${summary}`);
     }
+
+    clearHistory() {
+        this.fullHistory = [];
+        this.contextualHistory = [];
+        this.topicSummary = "대화가 초기화되었습니다.";
+        console.log('[대화 기록] 모든 대화 기록이 정리되었습니다.');
+    }
 }
 const conversationContext = new ConversationContext();
 
@@ -546,6 +553,33 @@ const usersByName = new Map();
 const aiStyles = new Map();
 const aiMemories = new Map();
 const participantRoles = new Map(); // <username, role>
+
+// ===================================================================================
+// 마피아 게임 상태 관리 (기존 시스템과 완전 분리)
+// ===================================================================================
+const MAFIA_GAME = {
+    isActive: false,
+    currentRound: 0,
+    totalRounds: 3,
+    gamePhase: 'waiting', // waiting, questioning, answering, voting, results, leaderboard_voting
+    participants: new Map(), // 게임 참가자 정보 (원본 이름과 랜덤 이름 매핑)
+    randomNames: ['당근', '고구마', '토마토', '가지', '양파', '브로콜리', '시금치', '상추', '오이', '호박'],
+    gameHost: null, // 게임 진행자 AI
+    currentQuestion: null,
+    answers: new Map(), // 라운드별 답변 저장
+    votes: new Map(), // 라운드별 투표 저장
+    leaderboard: new Map(), // 사용자별 점수
+    answerTimeouts: new Map(), // 답변 타임아웃 관리
+    voteTimeouts: new Map(), // 투표 타임아웃 관리
+    votingTimeout: null, // AI 찾기 투표 타임아웃
+    roundStartTime: null,
+    originalUserData: new Map(), // 원본 사용자 데이터 백업
+    originalRoles: new Map(), // 원본 역할 백업
+    // 게임 종료 후 투표 시스템
+    endGameVotes: new Map(), // 'chat' 또는 'again' 투표
+    leaderboardTimeout: null, // 리더보드 타임아웃
+    votingDeadline: null // 투표 마감 시간
+};
 
 const turnQueue = [];
 let isProcessingTurn = false;
@@ -562,12 +596,20 @@ const SOCKET_EVENTS = {
     CONNECTION: 'connection', DISCONNECT: 'disconnect', JOIN: 'join',
     JOIN_SUCCESS: 'join_success', JOIN_ERROR: 'join_error', CHAT_MESSAGE: 'chat_message',
     MESSAGE: 'message', USER_LIST: 'userList',
+    // 마피아 게임 전용 이벤트
+    MAFIA_START: 'mafia_start', MAFIA_END: 'mafia_end', MAFIA_QUESTION: 'mafia_question',
+    MAFIA_ANSWER: 'mafia_answer', MAFIA_VOTE: 'mafia_vote', MAFIA_ROUND_END: 'mafia_round_end',
+    MAFIA_GAME_END: 'mafia_game_end', MAFIA_UI_UPDATE: 'mafia_ui_update',
+    MAFIA_END_VOTE: 'mafia_end_vote', MAFIA_VOTING_UPDATE: 'mafia_voting_update'
 };
 
 const AI_ROLES = {
     SCRIBE: 'Scribe',
     MODERATOR: 'Moderator',
-    PARTICIPANT: 'Participant'
+    PARTICIPANT: 'Participant',
+    // 마피아 게임 전용 역할
+    MAFIA_HOST: 'MafiaHost',
+    MAFIA_PLAYER: 'MafiaPlayer'
 };
 
 
@@ -598,6 +640,994 @@ const searchTool = [{ "google_search_retrieval": {} }];
 // ===================================================================================
 function logMessage(msgObj) {
     conversationContext.addMessage(msgObj);
+}
+
+// ===================================================================================
+// 마피아 게임 핵심 함수들 (기존 시스템과 완전 분리)
+// ===================================================================================
+
+function parseMafiaCommand(message) {
+    const match = message.match(/^\/마피아(?:\s+(\d+))?$/);
+    if (match) {
+        const rounds = match[1] ? parseInt(match[1]) : 3;
+        return { isValid: true, rounds: Math.min(Math.max(rounds, 1), 10) };
+    }
+    return { isValid: false };
+}
+
+function checkGameEndCommand(message) {
+    return message.trim() === '/종료';
+}
+
+function assignMafiaRoles() {
+    // 기존 역할 백업
+    MAFIA_GAME.originalRoles.clear();
+    participantRoles.forEach((role, username) => {
+        MAFIA_GAME.originalRoles.set(username, role);
+    });
+    
+    // 기존 역할 모두 정지
+    participantRoles.clear();
+    
+    // 모든 AI 사용자 가져오기 (Moderator 포함)
+    const aiUsers = Array.from(users.values()).filter(u => u.isAI);
+    if (aiUsers.length === 0) {
+        console.log('[마피아 게임] AI가 없어 게임을 시작할 수 없습니다.');
+        return false;
+    }
+    
+    console.log(`[마피아 게임] 참여할 AI 목록: ${aiUsers.map(u => u.username).join(', ')}`);
+    
+    // 첫 번째 AI를 게임 진행자로 설정
+    const gameHost = aiUsers[0];
+    participantRoles.set(gameHost.username, AI_ROLES.MAFIA_HOST);
+    MAFIA_GAME.gameHost = gameHost.username;
+    
+    // 나머지 AI들을 모두 플레이어로 설정 (Moderator 역할이었던 AI도 포함)
+    for (let i = 1; i < aiUsers.length; i++) {
+        participantRoles.set(aiUsers[i].username, AI_ROLES.MAFIA_PLAYER);
+        console.log(`[마피아 게임] ${aiUsers[i].username}을(를) 플레이어로 설정`);
+    }
+    
+    console.log(`[마피아 게임] 역할 할당 완료 - 진행자: ${gameHost.username}, 플레이어: ${aiUsers.length - 1}명`);
+    console.log(`[마피아 게임] 모든 AI가 게임에 참여합니다 (Moderator 역할 해제)`);
+    return true;
+}
+
+function restoreOriginalRoles() {
+    // 마피아 게임 역할 제거
+    participantRoles.clear();
+    
+    // 원래 역할 복원
+    MAFIA_GAME.originalRoles.forEach((role, username) => {
+        participantRoles.set(username, role);
+        console.log(`[마피아 게임] ${username}의 역할을 ${role}로 복원`);
+    });
+    
+    MAFIA_GAME.originalRoles.clear();
+    console.log('[마피아 게임] 모든 AI 역할이 원래대로 복원되었습니다 (Moderator 역할 포함)');
+}
+
+function assignRandomNames() {
+    const allUsers = Array.from(users.values());
+    const shuffledNames = [...MAFIA_GAME.randomNames].sort(() => Math.random() - 0.5);
+    
+    MAFIA_GAME.participants.clear();
+    MAFIA_GAME.originalUserData.clear();
+    
+    allUsers.forEach((user, index) => {
+        // 원본 사용자 데이터 백업
+        MAFIA_GAME.originalUserData.set(user.username, {
+            originalName: user.username,
+            isAI: user.isAI,
+            socketId: user.id
+        });
+        
+        // 랜덤 이름 할당
+        const randomName = shuffledNames[index % shuffledNames.length] + (Math.floor(index / shuffledNames.length) || '');
+        MAFIA_GAME.participants.set(user.username, {
+            originalName: user.username,
+            randomName: randomName,
+            isAI: user.isAI,
+            hasAnswered: false,
+            hasVoted: false
+        });
+        
+        console.log(`[매핑] ${user.username} -> ${randomName} (AI:${user.isAI})`);
+    });
+    
+    console.log('[마피아 게임] 랜덤 이름 할당 완료');
+}
+
+function resetMafiaGame() {
+    // 게임 상태 초기화
+    MAFIA_GAME.isActive = false;
+    MAFIA_GAME.currentRound = 0;
+    MAFIA_GAME.gamePhase = 'waiting';
+    MAFIA_GAME.participants.clear();
+    MAFIA_GAME.gameHost = null;
+    MAFIA_GAME.currentQuestion = null;
+    MAFIA_GAME.answers.clear();
+    MAFIA_GAME.votes.clear();
+    // MAFIA_GAME.leaderboard.clear(); // 점수는 새 게임 시작할 때만 리셋 (리더보드 표시용으로 보존)
+    MAFIA_GAME.answerTimeouts.clear();
+    MAFIA_GAME.voteTimeouts.clear();
+    MAFIA_GAME.roundStartTime = null;
+    
+    // AI 찾기 투표 타임아웃 정리
+    if (MAFIA_GAME.votingTimeout) {
+        clearTimeout(MAFIA_GAME.votingTimeout);
+        MAFIA_GAME.votingTimeout = null;
+    }
+    
+    // 게임 종료 투표 관련 초기화
+    MAFIA_GAME.endGameVotes.clear();
+    MAFIA_GAME.votingDeadline = null;
+    if (MAFIA_GAME.leaderboardTimeout) {
+        clearTimeout(MAFIA_GAME.leaderboardTimeout);
+        MAFIA_GAME.leaderboardTimeout = null;
+    }
+    
+    // 타임아웃 정리
+    MAFIA_GAME.answerTimeouts.forEach(timeout => clearTimeout(timeout));
+    MAFIA_GAME.voteTimeouts.forEach(timeout => clearTimeout(timeout));
+    
+    // 역할 복원
+    restoreOriginalRoles();
+    
+    console.log('[마피아 게임] 게임 상태 완전 초기화 완료');
+}
+
+async function generateTuringTestQuestion() {
+    try {
+        // 다양한 질문 카테고리 정의
+        const questionCategories = [
+            {
+                name: "개인경험",
+                prompt: `개인적인 경험이나 감정을 묻는 주관적 체험 질문을 만들어줘.`,
+                examples: [
+                    "어릴 때 가장 창피했던 순간을 감정과 함께 구체적으로 말해보세요",
+                    "최근에 웃다가 예상치 못한 일이 벌어진 경험을 말해보세요",
+                    "밤에 혼자 있을 때 가장 무서웠던 순간과 그때 기분을 설명해주세요"
+                ]
+            },
+            {
+                name: "시사상식",
+                prompt: `최신 시사나 일반 상식을 묻는 퀴즈 형태의 질문을 만들어줘.`,
+                examples: [
+                    "2024년 가장 화제가 된 국제 뉴스 하나를 꼽고 개인적인 의견을 말해보세요",
+                    "요즘 MZ세대 사이에서 유행하는 단어나 표현 하나를 설명해보세요",
+                    "최근 1년 내 한국에서 일어난 중요한 사회적 이슈 하나를 말해보세요"
+                ]
+            },
+            {
+                name: "정치외교",
+                prompt: `정치나 외교 이슈에 대한 개인적 견해를 묻는 질문을 만들어줘.`,
+                examples: [
+                    "한일관계 개선에 대한 본인의 솔직한 생각을 말해보세요",
+                    "현재 정부 정책 중 가장 아쉬운 부분이 무엇인지 의견을 말해보세요",
+                    "북한과의 통일에 대해 개인적으로 어떻게 생각하시나요?"
+                ]
+            },
+            {
+                name: "넌센스퀴즈",
+                prompt: `재미있고 창의적인 넌센스 퀴즈나 유머러스한 질문을 만들어줘.`,
+                examples: [
+                    "치킨과 피자 중 하나만 평생 먹어야 한다면? 이유도 함께 말해보세요",
+                    "만약 투명인간이 될 수 있다면 가장 먼저 하고 싶은 일은?",
+                    "외계인이 지구에 온다면 가장 먼저 보여주고 싶은 한국 문화는?"
+                ]
+            },
+            {
+                name: "문화취향",
+                prompt: `개인적인 문화 취향이나 선호도를 묻는 질문을 만들어줘.`,
+                examples: [
+                    "최근에 본 드라마나 영화 중 가장 인상 깊었던 작품과 이유를 말해보세요",
+                    "본인만의 특별한 음악 취향이나 좋아하는 장르가 있나요?",
+                    "요즘 읽고 있는 책이나 관심 있는 분야를 소개해주세요"
+                ]
+            },
+            {
+                name: "일상생활",
+                prompt: `일상생활 속 개인적인 습관이나 경험을 묻는 질문을 만들어줘.`,
+                examples: [
+                    "스트레스 받을 때 본인만의 해소 방법이 있나요?",
+                    "아침형 인간인지 밤형 인간인지, 그 이유도 함께 말해보세요",
+                    "코로나 이후 달라진 본인의 생활 패턴이 있다면 무엇인가요?"
+                ]
+            }
+        ];
+
+        // 랜덤하게 카테고리 선택
+        const selectedCategory = questionCategories[Math.floor(Math.random() * questionCategories.length)];
+        
+        const prompt = `
+너는 마피아 게임의 진행자야. 사람과 AI를 구분할 수 있는 ${selectedCategory.name} 분야의 질문을 하나만 만들어줘.
+
+조건:
+1. ${selectedCategory.prompt}
+2. AI가 답하기 어려운 개인적이고 주관적인 요소 포함
+3. 한 문장으로 간결하게 작성
+4. 30초 내에 답변 가능한 수준
+5. 자연스럽고 대화하기 좋은 톤
+
+예시 (${selectedCategory.name} 분야):
+${selectedCategory.examples.map(ex => `- "${ex}"`).join('\n')}
+
+지금 ${MAFIA_GAME.currentRound}라운드입니다. [${selectedCategory.name}] 질문 하나만 작성해줘:`;
+
+        const result = await apiLimiter.executeAPICall(
+            async (contents, config) => await model.generateContent({
+                contents: contents,
+                generationConfig: config
+            }),
+            [{ role: 'user', parts: [{ text: prompt }] }],
+            { 
+                maxOutputTokens: 200,
+                temperature: 0.9
+            }
+        );
+
+        const question = (await result.response).text().trim();
+        console.log(`[마피아 게임] [${selectedCategory.name}] 질문 생성: ${question}`);
+        return question;
+    } catch (error) {
+        console.error('[마피아 게임] 질문 생성 오류:', error);
+        // 다양한 폴백 질문들
+        const fallbackQuestions = [
+            "어릴 때 가장 창피했던 순간을 감정과 함께 구체적으로 말해보세요",
+            "2024년 가장 화제가 된 뉴스 하나를 꼽고 개인적인 의견을 말해보세요",
+            "치킨과 피자 중 하나만 평생 먹어야 한다면? 이유도 함께 말해보세요",
+            "한일관계에 대한 본인의 솔직한 생각을 말해보세요",
+            "최근에 본 드라마나 영화 중 가장 인상 깊었던 작품을 말해보세요",
+            "스트레스 받을 때 본인만의 해소 방법이 있나요?"
+        ];
+        return fallbackQuestions[Math.floor(Math.random() * fallbackQuestions.length)];
+    }
+}
+
+async function generateMafiaPlayerResponse(question, aiName) {
+    try {
+        // 질문 유형 분석
+        const isPersonalExperience = question.includes('경험') || question.includes('순간') || question.includes('기분') || question.includes('감정');
+        const isCurrentEvents = question.includes('2024') || question.includes('뉴스') || question.includes('이슈') || question.includes('요즘');
+        const isPolitical = question.includes('정치') || question.includes('정부') || question.includes('관계') || question.includes('통일');
+        const isFunNonsense = question.includes('치킨') || question.includes('피자') || question.includes('투명인간') || question.includes('외계인');
+        const isCulture = question.includes('드라마') || question.includes('영화') || question.includes('음악') || question.includes('책');
+        const isLifestyle = question.includes('스트레스') || question.includes('아침형') || question.includes('밤형') || question.includes('코로나');
+
+        let prompt = `
+너는 마피아 게임에 참여한 플레이어야. 다음 질문에 반드시 답변해야 해.
+
+절대 규칙:
+1. 반드시 질문에 직접 답변해야 함 (회피, 이해 못한다는 말 금지)
+2. 정확히 한 문장으로만 답변 (두 문장 이상 금지)
+3. 자연스럽고 사람다운 답변으로 작성
+4. "잘 모르겠다", "이해하지 못하겠다" 같은 회피 표현 절대 금지
+
+`;
+
+        // 질문 유형별 답변 가이드 추가
+        if (isPersonalExperience) {
+            prompt += `5. 개인적인 경험이나 감정을 구체적이고 생생하게 표현`;
+        } else if (isCurrentEvents) {
+            prompt += `5. 시사나 상식에 대한 개인적인 견해나 알고 있는 정보 활용`;
+        } else if (isPolitical) {
+            prompt += `5. 정치/외교 이슈에 대한 개인적이고 균형잡힌 의견 표현`;
+        } else if (isFunNonsense) {
+            prompt += `5. 재미있고 유머러스한 톤으로 개인적인 선택과 이유 제시`;
+        } else if (isCulture) {
+            prompt += `5. 문화 컨텐츠에 대한 개인적인 취향이나 경험 표현`;
+        } else if (isLifestyle) {
+            prompt += `5. 일상생활 속 개인적인 습관이나 패턴을 자연스럽게 표현`;
+        } else {
+            prompt += `5. 개인적이고 주관적인 경험으로 자연스럽게 답변`;
+        }
+
+        prompt += `
+
+질문: ${question}
+
+한 문장 답변:`;
+
+        const result = await apiLimiter.executeAPICall(
+            async (contents, config) => await model.generateContent({
+                contents: contents,
+                generationConfig: config
+            }),
+            [{ role: 'user', parts: [{ text: prompt }] }],
+            { 
+                maxOutputTokens: 150,
+                temperature: 0.9
+            }
+        );
+
+        const answer = (await result.response).text().trim();
+        console.log(`[마피아 게임] ${aiName} AI 답변 생성: ${answer}`);
+        return answer;
+    } catch (error) {
+        console.error(`[마피아 게임] ${aiName} 답변 생성 오류:`, error);
+        return "음... 잘 기억이 안 나네요. 그런 경험이 있었던 것 같기도 하고...";
+    }
+}
+
+// 마피아 게임 메인 처리 함수들
+async function handleMafiaGameStart(msgObj) {
+    try {
+        const command = parseMafiaCommand(msgObj.content);
+        if (!command.isValid) {
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: '올바른 명령어: /마피아 [라운드수] (예: /마피아 3)',
+                timestamp: new Date().toISOString()
+            });
+            return;
+        }
+
+        // 이미 게임이 진행 중인 경우
+        if (MAFIA_GAME.isActive) {
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: '이미 마피아 게임이 진행 중입니다. /종료로 게임을 종료하고 다시 시작해주세요.',
+                timestamp: new Date().toISOString()
+            });
+            return;
+        }
+
+        // 게임 초기화 및 시작
+        MAFIA_GAME.totalRounds = command.rounds;
+        MAFIA_GAME.isActive = true;
+        MAFIA_GAME.currentRound = 0;
+        MAFIA_GAME.gamePhase = 'waiting';
+        
+        // 점수 시스템 초기화 (새 게임 시작 시에만)
+        MAFIA_GAME.leaderboard.clear();
+        console.log('[마피아 게임] 점수 시스템이 초기화되었습니다.');
+
+        // 기존 대화 로그 정리 (대화 맥락 초기화)
+        conversationContext.clearHistory();
+        console.log('[마피아 게임] 기존 대화 로그가 정리되었습니다.');
+
+        // 턴 큐 정리 및 진행 중인 AI 응답 중단
+        turnQueue.length = 0;
+        isProcessingTurn = false;
+        console.log('[마피아 게임] 기존 턴 큐와 진행 중인 응답이 정리되었습니다.');
+
+        // AI 역할 할당
+        if (!assignMafiaRoles()) {
+            resetMafiaGame();
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: 'AI가 없어 마피아 게임을 시작할 수 없습니다.',
+                timestamp: new Date().toISOString()
+            });
+            return;
+        }
+
+        // 랜덤 이름 할당
+        assignRandomNames();
+
+        // 클라이언트에 마피아 모드 전환 알림
+        io.emit(SOCKET_EVENTS.MAFIA_START, {
+            totalRounds: MAFIA_GAME.totalRounds,
+            participants: Array.from(MAFIA_GAME.participants.values()).map(p => ({
+                randomName: p.randomName,
+                isAI: p.isAI
+            }))
+        });
+
+        // 게임 시작 메시지
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'system',
+            content: `🎭 마피아 게임이 시작되었습니다! (총 ${MAFIA_GAME.totalRounds}라운드)\n모든 참가자의 이름이 랜덤으로 변경되었습니다.\n\n📊 점수 시스템:\n• AI 찾기 성공: +1점\n• 30초 내 미답변: -1점`,
+            timestamp: new Date().toISOString()
+        });
+
+        // 첫 번째 라운드 시작
+        setTimeout(() => startMafiaRound(), 2000);
+
+    } catch (error) {
+        console.error('[마피아 게임] 게임 시작 오류:', error);
+        resetMafiaGame();
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'system',
+            content: '마피아 게임 시작 중 오류가 발생했습니다.',
+            timestamp: new Date().toISOString()
+        });
+    }
+}
+
+async function startMafiaRound() {
+    try {
+        MAFIA_GAME.currentRound++;
+        MAFIA_GAME.gamePhase = 'questioning';
+        MAFIA_GAME.roundStartTime = Date.now();
+
+        // 투표 UI 닫기는 MAFIA_UI_UPDATE 이벤트에서 처리됨 (중복 이벤트 방지)
+        console.log(`[라운드 시작] 투표 UI 닫기는 MAFIA_UI_UPDATE 이벤트로 처리됩니다.`);
+
+        // 참가자 상태 초기화
+        MAFIA_GAME.participants.forEach(participant => {
+            participant.hasAnswered = false;
+            participant.hasVoted = false;
+        });
+
+        console.log(`[마피아 게임] ${MAFIA_GAME.currentRound}라운드 시작`);
+
+        // 게임 진행자가 질문 생성
+        const question = await generateTuringTestQuestion();
+        MAFIA_GAME.currentQuestion = question;
+
+        // 라운드 시작 알림 (게임 진행자 이름으로)
+        const hostName = MAFIA_GAME.participants.get(MAFIA_GAME.gameHost)?.randomName || '게임진행자';
+        
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'mafia_question',
+            from: hostName,
+            content: `🎭 ${MAFIA_GAME.currentRound}라운드입니다!\n\n질문: ${question}\n\n답변 시간 30초를 드립니다!`,
+            timestamp: new Date().toISOString()
+        });
+
+        // 답변 페이즈 시작
+        MAFIA_GAME.gamePhase = 'answering';
+
+        // AI 플레이어들 자동 답변 (마피아 게임 전용 지연시간: 7~15초)
+        const aiPlayers = Array.from(MAFIA_GAME.participants.entries())
+            .filter(([originalName, data]) => data.isAI && originalName !== MAFIA_GAME.gameHost);
+
+        aiPlayers.forEach(([originalName, data], index) => {
+            // 마피아 게임에서는 AI가 7~15초 사이에 랜덤하게 답변
+            const baseDelay = 7000 + Math.random() * 8000; // 7~15초 랜덤
+            const individualDelay = index * 1000; // AI들이 동시에 답변하지 않도록 1초씩 간격
+            const totalDelay = baseDelay + individualDelay;
+            
+            setTimeout(async () => {
+                if (MAFIA_GAME.gamePhase === 'answering' && !data.hasAnswered) {
+                    console.log(`[마피아 게임] ${data.randomName}(${originalName}) 답변 생성 시작 (${Math.round(totalDelay/1000)}초 후)`);
+                    
+                    const answer = await generateMafiaPlayerResponse(question, originalName);
+                    
+                    io.emit(SOCKET_EVENTS.MESSAGE, {
+                        type: 'mafia_answer',
+                        from: data.randomName,
+                        content: answer,
+                        timestamp: new Date().toISOString()
+                    });
+
+                    data.hasAnswered = true;
+                    console.log(`[마피아 게임] ${data.randomName}(${originalName}) 답변 완료`);
+                }
+            }, totalDelay);
+        });
+
+        // 30초 후 답변 타임아웃
+        setTimeout(() => {
+            if (MAFIA_GAME.gamePhase === 'answering') {
+                endAnsweringPhase();
+            }
+        }, 30000);
+
+    } catch (error) {
+        console.error('[마피아 게임] 라운드 시작 오류:', error);
+        handleMafiaGameEnd();
+    }
+}
+
+function handleMafiaAnswer(msgObj) {
+    try {
+        const participant = MAFIA_GAME.participants.get(msgObj.from);
+        if (!participant || participant.hasAnswered) {
+            return; // 이미 답변했거나 참가자가 아님
+        }
+
+        // 답변 기록
+        participant.hasAnswered = true;
+        
+        // 답변을 랜덤 이름으로 전송
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'mafia_answer',
+            from: participant.randomName,
+            content: msgObj.content,
+            timestamp: new Date().toISOString()
+        });
+
+        console.log(`[마피아 게임] ${participant.randomName}(${msgObj.from}) 답변: ${msgObj.content}`);
+
+        // 모든 참가자가 답변했는지 확인
+        const allAnswered = Array.from(MAFIA_GAME.participants.values())
+            .every(p => p.hasAnswered);
+
+        if (allAnswered) {
+            setTimeout(() => endAnsweringPhase(), 1000);
+        }
+
+    } catch (error) {
+        console.error('[마피아 게임] 답변 처리 오류:', error);
+    }
+}
+
+function endAnsweringPhase() {
+    try {
+        MAFIA_GAME.gamePhase = 'voting';
+
+        // 30초 내 답변하지 않은 사람 플레이어에게만 -1점 부여 (AI 제외)
+        const unansweredHumans = Array.from(MAFIA_GAME.participants.entries())
+            .filter(([originalName, data]) => {
+                // participants에 저장된 isAI 정보 직접 사용 (더 안전함)
+                const isRealHuman = !data.isAI;
+                const isNotHost = originalName !== MAFIA_GAME.gameHost;
+                const hasNotAnswered = !data.hasAnswered;
+                
+                console.log(`[미답변 체크] ${data.randomName}(${originalName}): AI=${data.isAI}, 진행자=${originalName === MAFIA_GAME.gameHost}, 답변=${data.hasAnswered}`);
+                
+                return isRealHuman && isNotHost && hasNotAnswered;
+            });
+
+        if (unansweredHumans.length > 0) {
+            console.log(`[미답변 패널티] ${unansweredHumans.length}명에게 패널티 부여 시작`);
+            
+            unansweredHumans.forEach(([originalName, data]) => {
+                const currentScore = MAFIA_GAME.leaderboard.get(originalName) || 0;
+                MAFIA_GAME.leaderboard.set(originalName, currentScore - 1);
+                console.log(`[점수 시스템] ${data.randomName}(${originalName}) 미답변으로 -1점 (이전: ${currentScore}점 → 현재: ${currentScore - 1}점)`);
+            });
+
+            const hostName = MAFIA_GAME.participants.get(MAFIA_GAME.gameHost)?.randomName || '게임진행자';
+            const penaltyNames = unansweredHumans.map(([originalName, _]) => originalName);
+            console.log(`[미답변 패널티] 패널티 대상자: ${penaltyNames.join(', ')}`);
+            
+            const penaltyMessage = `⏰ 시간 초과로 답변하지 못한 플레이어: ${penaltyNames.join(', ')}\n각각 -1점이 부여되었습니다.`;
+            
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'mafia_penalty',
+                from: hostName,
+                content: penaltyMessage,
+                timestamp: new Date().toISOString()
+            });
+        } else {
+            console.log(`[미답변 패널티] 모든 사람이 시간 내 답변 완료, 패널티 없음`);
+        }
+
+        const hostName = MAFIA_GAME.participants.get(MAFIA_GAME.gameHost)?.randomName || '게임진행자';
+        
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'mafia_voting',
+            from: hostName,
+            content: '🗳️ 답변이 완료되었습니다! 누가 AI일까요? 투표해주세요!',
+            timestamp: new Date().toISOString()
+        });
+
+        // 투표 UI 표시 (게임 진행자 제외하고 사람 플레이어에게만)
+        const participantNames = Array.from(MAFIA_GAME.participants.entries())
+            .filter(([originalName, data]) => originalName !== MAFIA_GAME.gameHost)
+            .map(([originalName, data]) => data.randomName);
+        
+        // Fisher-Yates 셔플 알고리즘으로 참가자 순서 랜덤화 (AI 찾기 난이도 증가)
+        for (let i = participantNames.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [participantNames[i], participantNames[j]] = [participantNames[j], participantNames[i]];
+        }
+        console.log(`[투표 UI] 참가자 순서 랜덤화 완료: ${participantNames.join(', ')}`);
+
+        // 사람 플레이어에게만 투표 UI 전송 (AI는 제외)
+        Array.from(MAFIA_GAME.participants.entries())
+            .filter(([originalName, data]) => !data.isAI) // AI가 아닌 사람만
+            .forEach(([originalName, data]) => {
+                // 해당 사용자의 소켓ID로 직접 전송
+                const userData = usersByName.get(originalName);
+                if (userData && userData.id) {
+                    io.to(userData.id).emit(SOCKET_EVENTS.MAFIA_VOTE, {
+                        phase: 'start',
+                        participants: participantNames
+                    });
+                    console.log(`[투표 UI] ${originalName}(사람)에게 투표 UI 전송 성공 (소켓ID: ${userData.id})`);
+                } else {
+                    console.log(`[투표 UI 오류] ${originalName}의 사용자 데이터를 찾을 수 없음: userData=${!!userData}, id=${userData?.id}`);
+                }
+            });
+
+        console.log(`[투표 UI] AI에게는 투표 UI를 전송하지 않음`);
+
+        // AI 찾기 투표 타임아웃 (10초)
+        MAFIA_GAME.votingTimeout = setTimeout(() => {
+            if (MAFIA_GAME.gamePhase === 'voting') {
+                console.log('[AI 찾기 투표] 10초 시간 초과로 투표 종료');
+                endVotingPhase();
+            }
+        }, 10000);
+
+    } catch (error) {
+        console.error('[마피아 게임] 투표 페이즈 전환 오류:', error);
+    }
+}
+
+function endVotingPhase() {
+    try {
+        MAFIA_GAME.gamePhase = 'results';
+
+        // 투표 종료 시 모든 사람 플레이어에게 UI 닫기 이벤트 전송
+        Array.from(MAFIA_GAME.participants.entries())
+            .filter(([originalName, data]) => !data.isAI) // AI가 아닌 사람만
+            .forEach(([originalName, data]) => {
+                const userData = usersByName.get(originalName);
+                if (userData && userData.id) {
+                    io.to(userData.id).emit(SOCKET_EVENTS.MAFIA_VOTE, {
+                        phase: 'end'
+                    });
+                    console.log(`[투표 UI] ${originalName}(사람) 투표 UI 닫기 전송 성공`);
+                }
+            });
+
+        // 투표 결과 집계
+        const voteResults = new Map();
+        MAFIA_GAME.votes.forEach((votedFor, voter) => {
+            voteResults.set(votedFor, (voteResults.get(votedFor) || 0) + 1);
+        });
+
+        // 가장 많이 투표받은 참가자 찾기
+        let maxVotes = 0;
+        let mostVoted = null;
+        voteResults.forEach((votes, name) => {
+            if (votes > maxVotes) {
+                maxVotes = votes;
+                mostVoted = name;
+            }
+        });
+
+        // 실제 AI 찾기
+        const actualAI = Array.from(MAFIA_GAME.participants.entries())
+            .filter(([name, data]) => data.isAI && name !== MAFIA_GAME.gameHost)
+            .map(([name, data]) => data.randomName);
+
+        // 결과 발표
+        const hostName = MAFIA_GAME.participants.get(MAFIA_GAME.gameHost)?.randomName || '게임진행자';
+        
+        let resultMessage = `🎯 ${MAFIA_GAME.currentRound}라운드 결과\n\n`;
+        resultMessage += `가장 많은 의심을 받은 참가자: ${mostVoted || '없음'} (${maxVotes}표)\n`;
+        resultMessage += `실제 AI: ${actualAI.join(', ')}\n\n`;
+
+        console.log(`[투표 결과 분석] 가장 많이 투표받은 참가자: ${mostVoted}, 실제 AI: ${actualAI.join(', ')}`);
+        console.log(`[투표 결과 분석] AI를 찾았는가: ${actualAI.includes(mostVoted)}`);
+        console.log(`[투표 결과 분석] 전체 투표 현황:`, Array.from(MAFIA_GAME.votes.entries()));
+
+        if (actualAI.includes(mostVoted)) {
+            resultMessage += '🎉 AI를 찾아냈습니다!';
+            
+            // AI에게 투표한 사람 플레이어들에게만 +1점 부여 (AI는 제외)
+            const correctVoters = [];
+            const correctVoterNames = [];
+            
+            MAFIA_GAME.votes.forEach((votedFor, voter) => {
+                console.log(`[투표 상세 분석] ${voter} -> ${votedFor} (AI 찾기: ${votedFor === mostVoted})`);
+                
+                // voter는 원래 사용자명(실제 대화명)이므로 직접 participants에서 찾기
+                const voterData = MAFIA_GAME.participants.get(voter);
+                
+                if (voterData && votedFor === mostVoted) {
+                    const originalName = voter; // voter가 이미 원래 사용자명
+                    const participantData = voterData;
+                    const isRealHuman = !participantData.isAI;
+                    
+                    console.log(`[정답 체크] ${participantData.randomName}(${originalName}): AI=${participantData.isAI}, 정답투표=${votedFor === mostVoted}`);
+                    
+                    if (isRealHuman) {
+                        const currentScore = MAFIA_GAME.leaderboard.get(originalName) || 0;
+                        MAFIA_GAME.leaderboard.set(originalName, currentScore + 1);
+                        correctVoters.push(participantData.randomName);
+                        correctVoterNames.push(originalName);
+                        console.log(`[점수 시스템] ${participantData.randomName}(${originalName}) AI 찾기 성공으로 +1점 (현재: ${currentScore + 1}점)`);
+                    }
+                }
+            });
+
+            if (correctVoterNames.length > 0) {
+                resultMessage += `\n\n🏆 AI를 찾은 플레이어: ${correctVoterNames.join(', ')}\n각각 +1점을 획득했습니다!`;
+            }
+        } else {
+            resultMessage += '😅 AI를 찾지 못했습니다...';
+        }
+
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'mafia_result',
+            from: hostName,
+            content: resultMessage,
+            timestamp: new Date().toISOString()
+        });
+
+        // 다음 라운드 또는 게임 종료
+        setTimeout(() => {
+            if (MAFIA_GAME.currentRound >= MAFIA_GAME.totalRounds) {
+                endMafiaGame();
+            } else {
+                // 이름 다시 섞고 다음 라운드
+                assignRandomNames();
+                io.emit(SOCKET_EVENTS.MAFIA_UI_UPDATE, {
+                    type: 'new_round',
+                    closeVotingUI: true, // 투표 UI 강제 닫기 플래그 추가
+                    participants: Array.from(MAFIA_GAME.participants.values()).map(p => ({
+                        randomName: p.randomName,
+                        isAI: p.isAI
+                    }))
+                });
+                startMafiaRound();
+            }
+        }, 3000);
+
+    } catch (error) {
+        console.error('[마피아 게임] 결과 처리 오류:', error);
+    }
+}
+
+function endMafiaGame() {
+    try {
+        // 게임 페이즈를 투표 모드로 변경
+        MAFIA_GAME.gamePhase = 'leaderboard_voting';
+        MAFIA_GAME.endGameVotes.clear();
+        MAFIA_GAME.votingDeadline = Date.now() + 60000; // 1분 후 마감
+
+        // 최종 리더보드 계산 및 순위 매기기
+        console.log(`[리더보드 생성] 원본 점수 데이터:`, Array.from(MAFIA_GAME.leaderboard.entries()));
+        
+        const sortedLeaderboard = Array.from(MAFIA_GAME.leaderboard.entries())
+            .sort((a, b) => b[1] - a[1]); // 점수 내림차순 정렬
+
+        console.log(`[리더보드 생성] 정렬된 점수 데이터:`, sortedLeaderboard);
+
+        // 모든 사람 참가자를 리더보드에 포함 (점수가 없으면 0점으로 처리)
+        const allHumanParticipants = Array.from(MAFIA_GAME.participants.entries())
+            .filter(([_, data]) => !data.isAI)
+            .map(([originalName, _]) => originalName);
+
+        console.log(`[리더보드 생성] 사람 참가자 목록:`, allHumanParticipants);
+
+        // 모든 참가자의 점수 정리 (기록 없으면 0점)
+        const completeLeaderboard = allHumanParticipants.map(name => {
+            const score = MAFIA_GAME.leaderboard.get(name) || 0;
+            return [name, score];
+        }).sort((a, b) => b[1] - a[1]); // 점수 내림차순 정렬
+
+        console.log(`[리더보드 생성] 완전한 리더보드:`, completeLeaderboard);
+
+        // 리더보드 메시지 생성 (원래 사용자 대화명 기준)
+        let leaderboardMessage = `🏆 마피아 게임 종료!\n총 ${MAFIA_GAME.totalRounds}라운드 완료\n\n`;
+        
+        if (completeLeaderboard.length > 0) {
+            // 1등 대형 표시 (원래 대화명 사용) - 큰 글꼴과 굵은 글씨 효과
+            const winner = completeLeaderboard[0];
+            const winnerOriginalName = winner[0]; // 실제 사용자 대화명
+            
+            leaderboardMessage += `🏆═══════════════════🏆\n`;
+            leaderboardMessage += `🥇  **🎉 1등: ${winnerOriginalName} 🎉**  🥇\n`;
+            leaderboardMessage += `      **⭐ ${winner[1]}점 ⭐**      \n`;
+            leaderboardMessage += `🏆═══════════════════🏆\n\n`;
+            
+            // 2등부터 순위별로 소형 표시 (원래 대화명 사용)
+            if (completeLeaderboard.length > 1) {
+                leaderboardMessage += `📋 전체 순위:\n`;
+                for (let i = 1; i < completeLeaderboard.length; i++) {
+                    const [originalName, score] = completeLeaderboard[i];
+                    
+                    const rankEmoji = i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}위`;
+                    leaderboardMessage += `${rankEmoji} ${originalName}: ${score}점\n`;
+                }
+            }
+        } else {
+            leaderboardMessage += `참가자가 없습니다.`;
+        }
+
+        // 최종 리더보드 메시지 전송
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'mafia_leaderboard',
+            content: leaderboardMessage,
+            timestamp: new Date().toISOString()
+        });
+
+        // 게임 종료 UI 표시 (투표 포함)
+        io.emit(SOCKET_EVENTS.MAFIA_GAME_END, {
+            totalRounds: MAFIA_GAME.totalRounds,
+            leaderboard: completeLeaderboard,
+            votingActive: true,
+            votingDeadline: MAFIA_GAME.votingDeadline
+        });
+
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'system',
+            content: `📊 리더보드가 1분간 표시됩니다.\n'채팅방 복귀' 또는 '한번 더' 중 선택해주세요!`,
+            timestamp: new Date().toISOString()
+        });
+
+        // 1분 후 자동 투표 처리
+        MAFIA_GAME.leaderboardTimeout = setTimeout(() => {
+            processEndGameVotes();
+        }, 60000);
+
+        console.log('[마피아 게임] 리더보드 투표 시작 (1분간)');
+
+    } catch (error) {
+        console.error('[마피아 게임] 게임 종료 오류:', error);
+        resetMafiaGame();
+    }
+}
+
+function handleMafiaGameEnd() {
+    try {
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'system',
+            content: '마피아 게임이 중단되었습니다.',
+            timestamp: new Date().toISOString()
+        });
+
+        resetMafiaGame();
+        io.emit(SOCKET_EVENTS.MAFIA_END);
+
+        io.emit(SOCKET_EVENTS.MESSAGE, {
+            type: 'system',
+            content: '일반 채팅 모드로 복귀했습니다.',
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('[마피아 게임] 게임 중단 오류:', error);
+    }
+}
+
+// 게임 종료 후 투표 처리
+function handleEndGameVote(username, voteType) {
+    try {
+        if (MAFIA_GAME.gamePhase !== 'leaderboard_voting') {
+            console.log(`[게임 종료 투표] ${username} 투표 거부: 게임 페이즈가 아님 (${MAFIA_GAME.gamePhase})`);
+            return false;
+        }
+
+        if (!['chat', 'again'].includes(voteType)) {
+            console.log(`[게임 종료 투표] ${username} 투표 거부: 잘못된 투표 타입 (${voteType})`);
+            return false;
+        }
+
+        // 사람 플레이어만 투표 가능하도록 체크
+        const participant = MAFIA_GAME.participants.get(username);
+        if (!participant || participant.isAI) {
+            console.log(`[게임 종료 투표] ${username} 투표 거부: AI 또는 참가자가 아님`);
+            return false;
+        }
+
+        // 투표 기록
+        MAFIA_GAME.endGameVotes.set(username, voteType);
+        console.log(`[게임 종료 투표] ${username}: ${voteType} (사람 플레이어)`);
+
+        // 실시간 투표 현황 업데이트
+        const voteStats = {
+            chat: 0,
+            again: 0,
+            total: MAFIA_GAME.endGameVotes.size
+        };
+
+        for (const vote of MAFIA_GAME.endGameVotes.values()) {
+            voteStats[vote]++;
+        }
+
+        io.emit(SOCKET_EVENTS.MAFIA_VOTING_UPDATE, voteStats);
+
+        // 모든 사람 참가자가 투표했는지 확인 (AI 제외)
+        const humanParticipants = Array.from(MAFIA_GAME.participants.values()).filter(p => !p.isAI);
+        const humanNames = humanParticipants.map(p => p.originalName);
+        const votedNames = Array.from(MAFIA_GAME.endGameVotes.keys());
+        
+        console.log(`[게임 종료 투표] 사람 플레이어 목록: ${humanNames.join(', ')}`);
+        console.log(`[게임 종료 투표] 투표한 플레이어: ${votedNames.join(', ')}`);
+        console.log(`[게임 종료 투표] 현재 투표 현황: ${MAFIA_GAME.endGameVotes.size}/${humanParticipants.length} (사람 플레이어만)`);
+        
+        if (MAFIA_GAME.endGameVotes.size >= humanParticipants.length) {
+            console.log('[게임 종료 투표] 모든 사람 참가자 투표 완료, 즉시 처리');
+            if (MAFIA_GAME.leaderboardTimeout) {
+                clearTimeout(MAFIA_GAME.leaderboardTimeout);
+            }
+            processEndGameVotes();
+        }
+
+        return true;
+    } catch (error) {
+        console.error('[게임 종료 투표] 오류:', error);
+        return false;
+    }
+}
+
+// 투표 결과 처리
+function processEndGameVotes() {
+    try {
+        console.log('[게임 종료 투표] 투표 결과 처리 시작');
+        
+        // 투표 집계
+        let chatVotes = 0;
+        let againVotes = 0;
+
+        for (const vote of MAFIA_GAME.endGameVotes.values()) {
+            if (vote === 'chat') chatVotes++;
+            else if (vote === 'again') againVotes++;
+        }
+
+        const totalVotes = chatVotes + againVotes;
+        let result;
+
+        if (totalVotes === 0) {
+            // 아무도 투표하지 않음 -> 기본값: 채팅방 복귀
+            result = 'chat';
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: '🔸 투표가 없어 일반 채팅방으로 복귀합니다.',
+                timestamp: new Date().toISOString()
+            });
+        } else if (chatVotes > againVotes) {
+            result = 'chat';
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: `📊 투표 결과: 채팅방 복귀 ${chatVotes}표, 한번 더 ${againVotes}표\n일반 채팅방으로 복귀합니다!`,
+                timestamp: new Date().toISOString()
+            });
+        } else if (againVotes > chatVotes) {
+            result = 'again';
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: `📊 투표 결과: 채팅방 복귀 ${chatVotes}표, 한번 더 ${againVotes}표\n새로운 마피아 게임을 시작합니다!`,
+                timestamp: new Date().toISOString()
+            });
+        } else {
+            // 동점 -> 기본값: 채팅방 복귀
+            result = 'chat';
+            io.emit(SOCKET_EVENTS.MESSAGE, {
+                type: 'system',
+                content: `📊 투표 결과: 동점 (각 ${chatVotes}표)\n일반 채팅방으로 복귀합니다!`,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        console.log(`[게임 종료 투표] 최종 결과: ${result} (채팅방 ${chatVotes}표, 한번 더 ${againVotes}표)`);
+
+        if (result === 'chat') {
+            // 채팅방 복귀
+            setTimeout(() => {
+                resetMafiaGame();
+                io.emit(SOCKET_EVENTS.MAFIA_END);
+                
+                io.emit(SOCKET_EVENTS.MESSAGE, {
+                    type: 'system',
+                    content: '✅ 일반 채팅 모드로 복귀했습니다.',
+                    timestamp: new Date().toISOString()
+                });
+            }, 2000);
+        } else {
+            // 새 게임 시작
+            setTimeout(() => {
+                // 새 게임 시작 안내
+                io.emit(SOCKET_EVENTS.MESSAGE, {
+                    type: 'system',
+                    content: '🎮 새로운 마피아 게임을 시작합니다!',
+                    timestamp: new Date().toISOString()
+                });
+                
+                // 먼저 리더보드 UI 정리
+                io.emit(SOCKET_EVENTS.MAFIA_END);
+                
+                setTimeout(() => {
+                    resetMafiaGame();
+                    
+                    // 자동으로 새 게임 시작
+                    const newGameMessage = {
+                        content: '/마피아 3',
+                        from: 'System',
+                        fromSocketId: null
+                    };
+                    handleMafiaGameStart(newGameMessage);
+                }, 1000);
+            }, 2000);
+        }
+
+    } catch (error) {
+        console.error('[게임 종료 투표] 처리 오류:', error);
+        // 오류 시 기본값: 채팅방 복귀
+        resetMafiaGame();
+        io.emit(SOCKET_EVENTS.MAFIA_END);
+    }
 }
 
 function assignScribeRole() {
@@ -903,9 +1933,12 @@ ${conditionalMemory}${conditionalModerator}${unifiedSelfAwareness}
         const needsSearch = searchKeywords.some(keyword => message.toLowerCase().includes(keyword));
         const apiCallOptions = {};
 
-        if (needsSearch) {
+        // 마피아 게임 중일 때는 웹 검색 기능 비활성화
+        if (needsSearch && !MAFIA_GAME.isActive) {
             apiCallOptions.tools = searchTool;
             console.log(`[도구 사용] 검색 키워드가 감지되어, AI '${aiName}'에게 검색 도구를 활성화합니다.`);
+        } else if (needsSearch && MAFIA_GAME.isActive) {
+            console.log(`[마피아 게임] AI '${aiName}'의 웹 검색 요청이 마피아 모드로 인해 차단되었습니다.`);
         }
 
         const result = await apiLimiter.executeAPICall(
@@ -985,6 +2018,12 @@ function findMentionedAI(message) {
 function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
     const respondingAIs = [];
     
+    // === 마피아 게임 중에는 일반 대화 로직 중단 ===
+    if (MAFIA_GAME.isActive) {
+        console.log('[마피아 게임] 마피아 게임 중이므로 일반 대화 AI 응답을 중단합니다.');
+        return []; // 마피아 게임 중에는 일반 AI 응답 시스템 비활성화
+    }
+    
     // === AI 혼자 모드 체크: AI가 혼자일 때는 자신의 메시지에 응답하지 않음 ===
     const allAIs = Array.from(users.values()).filter(u => u.isAI);
     if (allAIs.length === 1 && msgObj.from.startsWith('AI-')) {
@@ -1019,6 +2058,18 @@ function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
         if (ai.username === msgObj.from) {
             console.log(`[자기 응답 방지] ${ai.username}이(가) 자신의 메시지에 응답하지 않습니다.`);
             return { user: ai, score: 0 };
+        }
+
+        // === 연속 응답 방지: 같은 AI가 10초 내에 두 번 응답하지 않도록 ===
+        const recentHistory = conversationContext.getContextualHistorySnapshot().slice(-5);
+        const recentAIMessages = recentHistory.filter(m => m.from === ai.username);
+        if (recentAIMessages.length > 0) {
+            const lastAIMessage = recentAIMessages[recentAIMessages.length - 1];
+            const timeSinceLastResponse = Date.now() - new Date(lastAIMessage.timestamp).getTime();
+            if (timeSinceLastResponse < 2000) { // 2초 미만
+                console.log(`[연속 응답 방지] ${ai.username}이(가) ${Math.round(timeSinceLastResponse/1000)}초 전에 응답했으므로 제외됩니다.`);
+                return { user: ai, score: 0 };
+            }
         }
         
         let score = (ai.spontaneity || 0) + Math.floor(Math.random() * 20);
@@ -3967,6 +5018,24 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
             return;
         }
         
+        // 마피아 게임 명령어 처리
+        if (content.startsWith('/마피아')) {
+            handleMafiaGameStart(msgObj);
+            return;
+        }
+        
+        // 마피아 게임 종료 명령어 처리
+        if (checkGameEndCommand(content) && MAFIA_GAME.isActive) {
+            handleMafiaGameEnd();
+            return;
+        }
+        
+        // 마피아 게임 중인 경우 답변 처리
+        if (MAFIA_GAME.isActive && MAFIA_GAME.gamePhase === 'answering') {
+            handleMafiaAnswer(msgObj);
+            return;
+        }
+        
         logMessage(msgObj);
         io.emit(SOCKET_EVENTS.MESSAGE, msgObj);
         
@@ -4270,6 +5339,60 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
         } catch (error) {
             console.error('[Word 4단계 오류] 완료 처리 실패:', error);
             socket.emit('word_error', { message: 'Word 생성은 완료되었으나 다운로드 링크 생성에 실패했습니다.' });
+        }
+    });
+
+    // 마피아 게임 투표 처리
+    socket.on(SOCKET_EVENTS.MAFIA_VOTE, (data) => {
+        const fromUser = users.get(socket.id);
+        if (!fromUser || fromUser.isAI) return; // AI는 투표 안함
+        
+        if (!MAFIA_GAME.isActive || MAFIA_GAME.gamePhase !== 'voting') {
+            return; // 투표 시간이 아님
+        }
+        
+        const participant = MAFIA_GAME.participants.get(fromUser.username);
+        if (!participant || participant.hasVoted) {
+            return; // 이미 투표했거나 참가자가 아님
+        }
+        
+        // 투표 기록
+        participant.hasVoted = true;
+        MAFIA_GAME.votes.set(fromUser.username, data.votedFor);
+        
+        console.log(`[마피아 게임] ${fromUser.username}이(가) ${data.votedFor}에게 투표`);
+        
+        // 모든 사람이 투표했는지 확인
+        const humanParticipants = Array.from(MAFIA_GAME.participants.values())
+            .filter(p => !p.isAI);
+        const allVoted = humanParticipants.every(p => p.hasVoted);
+        
+        if (allVoted) {
+            console.log('[AI 찾기 투표] 모든 사람이 투표 완료, 2초 후 다음 라운드로 진행');
+            
+            // 기존 타임아웃 제거
+            if (MAFIA_GAME.votingTimeout) {
+                clearTimeout(MAFIA_GAME.votingTimeout);
+            }
+            
+            // 2초 후 투표 종료
+            MAFIA_GAME.votingTimeout = setTimeout(() => {
+                console.log('[AI 찾기 투표] 모든 투표 완료 후 2초 경과, 투표 종료');
+                endVotingPhase();
+            }, 2000);
+        }
+    });
+
+    // 마피아 게임 종료 후 투표 처리 (채팅방 복귀 vs 한번 더)
+    socket.on(SOCKET_EVENTS.MAFIA_END_VOTE, (data) => {
+        const fromUser = users.get(socket.id);
+        if (!fromUser || fromUser.isAI) {
+            return; // AI는 투표하지 않음
+        }
+        
+        const success = handleEndGameVote(fromUser.username, data.voteType);
+        if (success) {
+            socket.emit('vote_confirmed', { voteType: data.voteType });
         }
     });
 
