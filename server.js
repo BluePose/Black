@@ -8,6 +8,7 @@ const fs = require('fs');
 const { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } = require('@google/generative-ai');
 const PptxGenJS = require('pptxgenjs');
 const { Document, Packer, Paragraph, HeadingLevel, TextRun, Table, TableRow, TableCell, WidthType, AlignmentType } = require('docx');
+const cheerio = require('cheerio');
 
 // 아바타 시스템 로드
 const { getUserAvatarIndex, getUserAvatar } = require('./public/avatars.js');
@@ -21,7 +22,7 @@ const config = {
     GOOGLE_API_KEY: process.env.GOOGLE_API_KEY,
     API_REQUEST_TIMEOUT: 30000,
     MEETING_MINUTES_MAX_TOKENS: 4096,
-    AI_RESPONSE_BASE_DELAY: 4000,
+    AI_RESPONSE_BASE_DELAY: 3000,
     AI_RESPONSE_RANDOM_DELAY: 2000,
     LOG_FILE_PATH: path.join(__dirname, 'chat.log'),
     CONTEXT_SUMMARY_INTERVAL: 120000, // 2분마다 대화 주제 요약
@@ -496,8 +497,10 @@ class ConversationContext {
                 return;
             }
             
+            // 최근 7개 메시지는 압축하지 않고 보존
+            const recentMessages = this.contextualHistory.slice(-7);
             const toSummarize = this.contextualHistory.slice(0, numToSummarize);
-            const remainingHistory = this.contextualHistory.slice(numToSummarize);
+            const remainingHistory = this.contextualHistory.slice(numToSummarize, -7);
 
             const conversationToSummarize = toSummarize.map(m => `${m.from}: ${m.content}`).join('\n');
             const prompt = `다음은 긴 대화의 일부입니다. 이 대화의 핵심 내용을 단 한 문장으로 요약해주세요: \n\n${conversationToSummarize}`;
@@ -517,12 +520,15 @@ class ConversationContext {
                 type: 'summary'
             };
 
-            this.contextualHistory = [summaryMessage, ...remainingHistory];
-            console.log(`[메모리 압축] 압축 완료. 현재 컨텍스트 기록 길이: ${this.contextualHistory.length}`);
+            // 요약 메시지 + 중간 기록 + 최근 7개 메시지 순서로 재구성
+            this.contextualHistory = [summaryMessage, ...remainingHistory, ...recentMessages];
+            console.log(`[메모리 압축] 압축 완료. 현재 컨텍스트 기록 길이: ${this.contextualHistory.length} (최근 7개 메시지 보존)`);
         } catch (error) {
             console.error('[메모리 압축] 기록 요약 중 오류 발생:', error);
-            // 요약 실패 시, 가장 오래된 기록을 단순히 잘라내서 무한 루프 방지
+            // 요약 실패 시, 가장 오래된 기록을 단순히 잘라내서 무한 루프 방지 (최근 7개는 보존)
+            const recentMessages = this.contextualHistory.slice(-7);
             this.contextualHistory.splice(0, config.MAX_CONTEXT_LENGTH - config.TARGET_CONTEXT_LENGTH + 1);
+            this.contextualHistory.push(...recentMessages);
         } finally {
             this.isSummarizing = false;
         }
@@ -584,6 +590,9 @@ const MAFIA_GAME = {
 const turnQueue = [];
 let isProcessingTurn = false;
 let isConversationPausedForMeetingNotes = false; // 회의록 작성 중 AI 대화 일시 중지 플래그
+// 🛡️ 무한 루프 방지: 처리된 메시지 ID 추적 (10분간 유지)
+const processedMessageIds = new Set();
+const MESSAGE_ID_CLEANUP_INTERVAL = 10 * 60 * 1000; // 10분
 
 // 사회자 관련 상태
 let moderatorTurnCount = 0; // 사회자 개입 턴 카운터
@@ -591,6 +600,18 @@ let lastModeratorTime = Date.now(); // 마지막 사회자 개입 시간
 let lastModeratorDirective = null; // 최근 사회자 지시사항
 let moderatorDirectiveExpiry = 0; // 지시 유효 시간
 const DIRECTIVE_DURATION = 10000; // 10초간 지시 유효
+
+// 🎯 AI 대화 자연스러움 관리 시스템 (구글 수석 프로그래머 수준 최적화)
+const AI_RESPONSE_TIMING = {
+    MIN_INTERVAL: 0, // AI 간 최소 응답 간격 (순차 딜레이로 대체)
+    AI_COOLDOWN: 3000,  // 같은 AI 재응답 쿨다운 (3초로 조정)
+    MODERATOR_EXEMPT: true // 진행자 AI는 제외
+};
+
+// AI별 마지막 응답 시간 추적
+const aiLastResponseTime = new Map();
+// AI별 마지막 발언 시간 추적 (자기 재응답 방지)
+const aiLastSpeakTime = new Map();
 
 const SOCKET_EVENTS = {
     CONNECTION: 'connection', DISCONNECT: 'disconnect', JOIN: 'join',
@@ -778,68 +799,168 @@ function resetMafiaGame() {
     console.log('[마피아 게임] 게임 상태 완전 초기화 완료');
 }
 
+// 최근 사용한 카테고리 추적 (중복 방지용)
+let recentQuestionCategories = [];
+
 async function generateTuringTestQuestion() {
     try {
-        // 다양한 질문 카테고리 정의
+        // 대폭 확장된 다양한 질문 카테고리 정의
         const questionCategories = [
             {
-                name: "개인경험",
-                prompt: `개인적인 경험이나 감정을 묻는 주관적 체험 질문을 만들어줘.`,
+                name: "어린시절추억",
+                prompt: `어린 시절의 구체적인 추억이나 경험을 묻는 질문을 만들어줘.`,
                 examples: [
-                    "어릴 때 가장 창피했던 순간을 감정과 함께 구체적으로 말해보세요",
-                    "최근에 웃다가 예상치 못한 일이 벌어진 경험을 말해보세요",
-                    "밤에 혼자 있을 때 가장 무서웠던 순간과 그때 기분을 설명해주세요"
+                    "초등학교 때 가장 기억에 남는 선생님과의 에피소드를 말해보세요",
+                    "어릴 때 부모님께 거짓말한 적이 있다면 어떤 일이었나요",
+                    "중학교 때 첫사랑에 대한 추억이 있다면 살짝만 말해보세요"
                 ]
             },
             {
-                name: "시사상식",
-                prompt: `최신 시사나 일반 상식을 묻는 퀴즈 형태의 질문을 만들어줘.`,
+                name: "실수와당황",
+                prompt: `개인적인 실수나 당황스러웠던 순간에 대한 질문을 만들어줘.`,
                 examples: [
-                    "2024년 가장 화제가 된 국제 뉴스 하나를 꼽고 개인적인 의견을 말해보세요",
-                    "요즘 MZ세대 사이에서 유행하는 단어나 표현 하나를 설명해보세요",
-                    "최근 1년 내 한국에서 일어난 중요한 사회적 이슈 하나를 말해보세요"
+                    "지하철에서 가장 당황스러웠던 순간이 있다면 말해보세요",
+                    "잘못 알고 있다가 나중에 깨달은 상식이나 정보가 있나요",
+                    "길에서 아는 사람인 줄 알고 인사했는데 모르는 사람이었던 경험이 있나요"
                 ]
             },
             {
-                name: "정치외교",
-                prompt: `정치나 외교 이슈에 대한 개인적 견해를 묻는 질문을 만들어줘.`,
+                name: "취미와관심사",
+                prompt: `개인적인 취미나 특별한 관심사에 대한 질문을 만들어줘.`,
                 examples: [
-                    "한일관계 개선에 대한 본인의 솔직한 생각을 말해보세요",
-                    "현재 정부 정책 중 가장 아쉬운 부분이 무엇인지 의견을 말해보세요",
-                    "북한과의 통일에 대해 개인적으로 어떻게 생각하시나요?"
+                    "남들은 이상하게 생각하지만 본인만 좋아하는 것이 있나요",
+                    "요즘 빠져있는 유튜브 채널이나 콘텐츠가 있다면 소개해주세요",
+                    "혼자만의 시간에 가장 자주 하는 일이 무엇인가요"
                 ]
             },
             {
-                name: "넌센스퀴즈",
-                prompt: `재미있고 창의적인 넌센스 퀴즈나 유머러스한 질문을 만들어줘.`,
+                name: "음식과입맛",
+                prompt: `개인적인 음식 취향이나 식습관에 대한 질문을 만들어줘.`,
                 examples: [
-                    "치킨과 피자 중 하나만 평생 먹어야 한다면? 이유도 함께 말해보세요",
-                    "만약 투명인간이 될 수 있다면 가장 먼저 하고 싶은 일은?",
-                    "외계인이 지구에 온다면 가장 먼저 보여주고 싶은 한국 문화는?"
+                    "어떤 음식을 먹을 때 가장 행복한 기분이 드나요",
+                    "남들은 좋아하는데 본인만 싫어하는 음식이 있나요",
+                    "집에서 라면 끓일 때만의 특별한 레시피나 방법이 있나요"
                 ]
             },
             {
-                name: "문화취향",
-                prompt: `개인적인 문화 취향이나 선호도를 묻는 질문을 만들어줘.`,
+                name: "인간관계고민",
+                prompt: `인간관계나 소통에 관한 개인적인 경험을 묻는 질문을 만들어줘.`,
                 examples: [
-                    "최근에 본 드라마나 영화 중 가장 인상 깊었던 작품과 이유를 말해보세요",
-                    "본인만의 특별한 음악 취향이나 좋아하는 장르가 있나요?",
-                    "요즘 읽고 있는 책이나 관심 있는 분야를 소개해주세요"
+                    "친구와 싸운 후 화해하는 본인만의 방법이 있나요",
+                    "처음 만나는 사람과 대화할 때 어떤 주제로 시작하시나요",
+                    "가족 중에서 가장 닮고 싶은 사람과 그 이유를 말해보세요"
                 ]
             },
             {
-                name: "일상생활",
-                prompt: `일상생활 속 개인적인 습관이나 경험을 묻는 질문을 만들어줘.`,
+                name: "학창시절기억",
+                prompt: `학창시절의 특별한 기억이나 에피소드를 묻는 질문을 만들어줘.`,
                 examples: [
-                    "스트레스 받을 때 본인만의 해소 방법이 있나요?",
-                    "아침형 인간인지 밤형 인간인지, 그 이유도 함께 말해보세요",
-                    "코로나 이후 달라진 본인의 생활 패턴이 있다면 무엇인가요?"
+                    "학교 급식 중에서 가장 좋아했던 메뉴와 싫어했던 메뉴는?",
+                    "시험 공부할 때만의 특별한 징크스나 습관이 있었나요",
+                    "학교 축제나 체육대회에서 기억에 남는 에피소드가 있나요"
+                ]
+            },
+            {
+                name: "현대트렌드",
+                prompt: `최신 트렌드나 유행에 대한 개인적인 견해를 묻는 질문을 만들어줘.`,
+                examples: [
+                    "요즘 유행하는 것 중에 본인은 이해 안 되는 게 있나요",
+                    "SNS에서 가장 자주 보는 콘텐츠나 계정 유형은 무엇인가요",
+                    "최근에 새로 알게 된 신조어나 줄임말이 있다면 소개해주세요"
+                ]
+            },
+            {
+                name: "여행과장소",
+                prompt: `여행이나 특별한 장소에 대한 개인적인 경험을 묻는 질문을 만들어줘.`,
+                examples: [
+                    "가본 곳 중에서 다시 가고 싶지 않은 장소와 그 이유는?",
+                    "혼자 여행할 때와 같이 여행할 때 중 어느 쪽을 더 선호하나요",
+                    "집 근처에서 가장 좋아하는 산책 코스나 장소가 있나요"
+                ]
+            },
+            {
+                name: "소소한일상",
+                prompt: `일상의 소소한 습관이나 루틴에 대한 질문을 만들어줘.`,
+                examples: [
+                    "잠들기 전에 반드시 하는 일이나 루틴이 있나요",
+                    "기분이 우울할 때 본인만의 기분전환 방법이 있나요",
+                    "휴대폰 알람 소리는 어떤 걸 쓰시고, 특별한 이유가 있나요"
+                ]
+            },
+            {
+                name: "재미있는상상",
+                prompt: `창의적이고 재미있는 가상 상황에 대한 질문을 만들어줘.`,
+                examples: [
+                    "하루 동안 아무 능력이나 가질 수 있다면 무엇을 선택하고 싶나요",
+                    "만약 과거로 돌아갈 수 있다면 몇 살 때로 가고 싶나요",
+                    "동물 중에서 대화할 수 있다면 어떤 동물과 이야기해보고 싶나요"
+                ]
+            },
+            {
+                name: "개인적선호",
+                prompt: `개인적인 선호나 취향의 차이에 대한 질문을 만들어줘.`,
+                examples: [
+                    "봄, 여름, 가을, 겨울 중 가장 좋아하는 계절과 그 이유는?",
+                    "영화 볼 때 자막파인지 더빙파인지, 그 이유도 함께 말해보세요",
+                    "집에서 쉴 때 완전히 조용한 게 좋은지 배경음악이 있는 게 좋은지요"
+                ]
+            },
+            {
+                name: "기술과디지털",
+                prompt: `기술이나 디지털 기기 사용에 대한 개인적인 경험을 묻는 질문을 만들어줘.`,
+                examples: [
+                    "스마트폰에서 가장 자주 사용하는 앱 3개는 무엇인가요",
+                    "새로운 앱이나 기술을 배울 때 어려움을 느끼는 편인가요",
+                    "온라인 쇼핑과 오프라인 쇼핑 중 어느 쪽을 더 선호하나요"
+                ]
+            },
+            {
+                name: "감정과기분",
+                prompt: `감정이나 기분의 변화에 대한 개인적인 경험을 묻는 질문을 만들어줘.`,
+                examples: [
+                    "화가 날 때 진정하는 본인만의 방법이 있나요",
+                    "갑자기 기분이 좋아지는 순간이나 상황이 있다면 언제인가요",
+                    "스트레스를 받으면 주로 어떤 신체적 증상이 나타나나요"
+                ]
+            },
+            {
+                name: "미래와꿈",
+                prompt: `미래에 대한 계획이나 꿈에 대한 개인적인 생각을 묻는 질문을 만들어줘.`,
+                examples: [
+                    "10년 후의 본인 모습을 상상해본다면 어떤 일을 하고 있을까요",
+                    "언젠가 꼭 도전해보고 싶은 일이나 경험이 있나요",
+                    "지금보다 더 여유로운 삶을 살려면 무엇이 가장 필요할까요"
                 ]
             }
         ];
 
+        // 중복 방지 로직: 최근 3개 카테고리 제외
+        const maxRecentCategories = 3;
+        let availableCategories = questionCategories;
+        
+        if (recentQuestionCategories.length > 0) {
+            availableCategories = questionCategories.filter(cat => 
+                !recentQuestionCategories.includes(cat.name)
+            );
+            
+            // 만약 사용 가능한 카테고리가 너무 적다면 제한 완화
+            if (availableCategories.length < 5) {
+                console.log('[질문 생성] 사용 가능한 카테고리가 부족하여 제한을 완화합니다.');
+                availableCategories = questionCategories;
+                recentQuestionCategories = []; // 리셋
+            }
+        }
+
         // 랜덤하게 카테고리 선택
-        const selectedCategory = questionCategories[Math.floor(Math.random() * questionCategories.length)];
+        const selectedCategory = availableCategories[Math.floor(Math.random() * availableCategories.length)];
+        
+        // 최근 사용 카테고리에 추가
+        recentQuestionCategories.push(selectedCategory.name);
+        if (recentQuestionCategories.length > maxRecentCategories) {
+            recentQuestionCategories.shift(); // 오래된 것 제거
+        }
+        
+        console.log(`[질문 생성] 선택된 카테고리: ${selectedCategory.name}, 최근 사용 목록: [${recentQuestionCategories.join(', ')}]`);
         
         const prompt = `
 너는 마피아 게임의 진행자야. 사람과 AI를 구분할 수 있는 ${selectedCategory.name} 분야의 질문을 하나만 만들어줘.
@@ -873,14 +994,36 @@ ${selectedCategory.examples.map(ex => `- "${ex}"`).join('\n')}
         return question;
     } catch (error) {
         console.error('[마피아 게임] 질문 생성 오류:', error);
-        // 다양한 폴백 질문들
+        // 14개 카테고리에서 골고루 선택된 다양한 폴백 질문들
         const fallbackQuestions = [
-            "어릴 때 가장 창피했던 순간을 감정과 함께 구체적으로 말해보세요",
-            "2024년 가장 화제가 된 뉴스 하나를 꼽고 개인적인 의견을 말해보세요",
-            "치킨과 피자 중 하나만 평생 먹어야 한다면? 이유도 함께 말해보세요",
-            "한일관계에 대한 본인의 솔직한 생각을 말해보세요",
-            "최근에 본 드라마나 영화 중 가장 인상 깊었던 작품을 말해보세요",
-            "스트레스 받을 때 본인만의 해소 방법이 있나요?"
+            // 어린시절추억
+            "초등학교 때 가장 기억에 남는 선생님과의 에피소드를 말해보세요",
+            // 실수와당황
+            "지하철에서 가장 당황스러웠던 순간이 있다면 말해보세요",
+            // 취미와관심사
+            "남들은 이상하게 생각하지만 본인만 좋아하는 것이 있나요",
+            // 음식과입맛
+            "어떤 음식을 먹을 때 가장 행복한 기분이 드나요",
+            // 인간관계고민
+            "친구와 싸운 후 화해하는 본인만의 방법이 있나요",
+            // 학창시절기억
+            "학교 급식 중에서 가장 좋아했던 메뉴와 싫어했던 메뉴는?",
+            // 현대트렌드
+            "요즘 유행하는 것 중에 본인은 이해 안 되는 게 있나요",
+            // 여행과장소
+            "가본 곳 중에서 다시 가고 싶지 않은 장소와 그 이유는?",
+            // 소소한일상
+            "잠들기 전에 반드시 하는 일이나 루틴이 있나요",
+            // 재미있는상상
+            "하루 동안 아무 능력이나 가질 수 있다면 무엇을 선택하고 싶나요",
+            // 개인적선호
+            "봄, 여름, 가을, 겨울 중 가장 좋아하는 계절과 그 이유는?",
+            // 기술과디지털
+            "스마트폰에서 가장 자주 사용하는 앱 3개는 무엇인가요",
+            // 감정과기분
+            "화가 날 때 진정하는 본인만의 방법이 있나요",
+            // 미래와꿈
+            "10년 후의 본인 모습을 상상해본다면 어떤 일을 하고 있을까요"
         ];
         return fallbackQuestions[Math.floor(Math.random() * fallbackQuestions.length)];
     }
@@ -888,47 +1031,79 @@ ${selectedCategory.examples.map(ex => `- "${ex}"`).join('\n')}
 
 async function generateMafiaPlayerResponse(question, aiName) {
     try {
-        // 질문 유형 분석
-        const isPersonalExperience = question.includes('경험') || question.includes('순간') || question.includes('기분') || question.includes('감정');
-        const isCurrentEvents = question.includes('2024') || question.includes('뉴스') || question.includes('이슈') || question.includes('요즘');
-        const isPolitical = question.includes('정치') || question.includes('정부') || question.includes('관계') || question.includes('통일');
-        const isFunNonsense = question.includes('치킨') || question.includes('피자') || question.includes('투명인간') || question.includes('외계인');
-        const isCulture = question.includes('드라마') || question.includes('영화') || question.includes('음악') || question.includes('책');
-        const isLifestyle = question.includes('스트레스') || question.includes('아침형') || question.includes('밤형') || question.includes('코로나');
+        // 더 정교한 질문 유형 분석
+        const isChildhoodMemory = question.includes('어릴') || question.includes('초등학교') || question.includes('중학교') || question.includes('선생님') || question.includes('첫사랑');
+        const isMistakeEmbarrassing = question.includes('당황') || question.includes('실수') || question.includes('잘못') || question.includes('깨달은') || question.includes('인사했는데');
+        const isHobbyInterest = question.includes('취미') || question.includes('관심사') || question.includes('이상하게') || question.includes('유튜브') || question.includes('혼자만의');
+        const isFood = question.includes('음식') || question.includes('라면') || question.includes('행복한') || question.includes('싫어하는') || question.includes('레시피');
+        const isRelationship = question.includes('친구') || question.includes('화해') || question.includes('대화') || question.includes('가족') || question.includes('닮고');
+        const isSchoolMemory = question.includes('급식') || question.includes('시험') || question.includes('축제') || question.includes('체육대회') || question.includes('징크스');
+        const isModernTrend = question.includes('트렌드') || question.includes('유행') || question.includes('SNS') || question.includes('신조어') || question.includes('줄임말');
+        const isTravelPlace = question.includes('여행') || question.includes('장소') || question.includes('산책') || question.includes('혼자') || question.includes('같이');
+        const isDailyLife = question.includes('잠들기') || question.includes('루틴') || question.includes('우울할') || question.includes('알람') || question.includes('기분전환');
+        const isImagination = question.includes('능력') || question.includes('과거로') || question.includes('동물') || question.includes('투명인간') || question.includes('외계인');
+        const isPersonalPref = question.includes('계절') || question.includes('자막') || question.includes('더빙') || question.includes('조용한') || question.includes('배경음악');
+        const isTechDigital = question.includes('스마트폰') || question.includes('앱') || question.includes('기술') || question.includes('온라인') || question.includes('오프라인');
+        const isEmotionMood = question.includes('화가') || question.includes('기분이') || question.includes('진정') || question.includes('스트레스') || question.includes('증상');
+        const isFutureDream = question.includes('10년') || question.includes('미래') || question.includes('도전') || question.includes('여유로운') || question.includes('필요할까');
 
         let prompt = `
-너는 마피아 게임에 참여한 플레이어야. 다음 질문에 반드시 답변해야 해.
+너는 마피아 게임에 참여하고 있는 일반 사람이야. 다음 질문에 진짜 사람처럼 자연스럽게 답변해야 해.
 
-절대 규칙:
-1. 반드시 질문에 직접 답변해야 함 (회피, 이해 못한다는 말 금지)
-2. 정확히 한 문장으로만 답변 (두 문장 이상 금지)
-3. 자연스럽고 사람다운 답변으로 작성
-4. "잘 모르겠다", "이해하지 못하겠다" 같은 회피 표현 절대 금지
+💯 답변 스타일 규칙:
+1. 진짜 사람이 실제로 할 법한 답변 (AI 같은 완벽한 답변 금지)
+2. 1문장으로, 50글자 이내로 간결하게
+3. 일상적이고 자연스러운 말투 사용 (격식 차리지 말고)
+4. 구두점 없이 끝내기 (마침표, 느낌표, 물음표 금지)
+5. 개인적이고 주관적인 경험으로 답변
 
-`;
+🎯 `;
 
-        // 질문 유형별 답변 가이드 추가
-        if (isPersonalExperience) {
-            prompt += `5. 개인적인 경험이나 감정을 구체적이고 생생하게 표현`;
-        } else if (isCurrentEvents) {
-            prompt += `5. 시사나 상식에 대한 개인적인 견해나 알고 있는 정보 활용`;
-        } else if (isPolitical) {
-            prompt += `5. 정치/외교 이슈에 대한 개인적이고 균형잡힌 의견 표현`;
-        } else if (isFunNonsense) {
-            prompt += `5. 재미있고 유머러스한 톤으로 개인적인 선택과 이유 제시`;
-        } else if (isCulture) {
-            prompt += `5. 문화 컨텐츠에 대한 개인적인 취향이나 경험 표현`;
-        } else if (isLifestyle) {
-            prompt += `5. 일상생활 속 개인적인 습관이나 패턴을 자연스럽게 표현`;
+        // 질문 유형별 맞춤 답변 가이드
+        if (isChildhoodMemory) {
+            prompt += `어린시절 답변법: 구체적인 기억이나 감정을 솔직하게 표현. "그때 진짜", "완전", "되게" 같은 자연스러운 표현 활용`;
+        } else if (isMistakeEmbarrassing) {
+            prompt += `실수/당황 답변법: 진짜 있을 법한 경험을 생생하게. "아 그때", "진짜 민망했는데", "완전 창피해서" 같은 솔직한 표현`;
+        } else if (isHobbyInterest) {
+            prompt += `취미/관심사 답변법: 개인적인 선호를 자연스럽게. "요즘 빠져있는 건", "나만 좋아하는", "완전 내 스타일" 같은 표현`;
+        } else if (isFood) {
+            prompt += `음식 답변법: 맛이나 기분을 생생하게 표현. "진짜 맛있어서", "나는 별로", "꿀조합" 같은 일상어 활용`;
+        } else if (isRelationship) {
+            prompt += `인간관계 답변법: 실제 경험을 바탕으로 솔직하게. "그냥", "되게", "진짜" 같은 자연스러운 표현`;
+        } else if (isSchoolMemory) {
+            prompt += `학창시절 답변법: 추억을 구체적이고 친근하게. "그때 우리 학교", "완전 좋아했는데", "매일 했던" 같은 표현`;
+        } else if (isModernTrend) {
+            prompt += `트렌드 답변법: 솔직한 개인 의견을 자연스럽게. "요즘 애들이", "나는 잘 모르겠는데", "완전 신기해" 같은 표현`;
+        } else if (isTravelPlace) {
+            prompt += `여행/장소 답변법: 개인적인 경험과 감정을 편하게. "거기 가봤는데", "완전 좋았어", "나는 혼자가" 같은 표현`;
+        } else if (isDailyLife) {
+            prompt += `일상 답변법: 개인적인 습관을 솔직하게. "맨날 하는 게", "꼭 해야 돼", "내 루틴은" 같은 일상적 표현`;
+        } else if (isImagination) {
+            prompt += `상상 답변법: 재미있고 창의적으로. "완전 신기할 것 같은데", "진짜 해보고 싶은 건", "상상만 해도" 같은 표현`;
+        } else if (isPersonalPref) {
+            prompt += `선호도 답변법: 개인 취향을 자연스럽게. "나는 되게", "완전 내 스타일", "원래 좋아해서" 같은 표현`;
+        } else if (isTechDigital) {
+            prompt += `기술 답변법: 일상적인 디지털 사용 경험으로. "매일 쓰는 건", "요즘 자주", "완전 편해" 같은 표현`;
+        } else if (isEmotionMood) {
+            prompt += `감정 답변법: 솔직한 감정 표현으로. "진짜 화날 때", "그럴 때마다", "나는 보통" 같은 자연스러운 표현`;
+        } else if (isFutureDream) {
+            prompt += `미래/꿈 답변법: 개인적인 바람이나 계획을 편하게. "언젠가는", "꼭 해보고 싶은 게", "그때쯤이면" 같은 표현`;
         } else {
-            prompt += `5. 개인적이고 주관적인 경험으로 자연스럽게 답변`;
+            prompt += `일반 답변법: 진짜 사람답게 개인적인 경험으로 자연스럽게 대답`;
         }
 
         prompt += `
 
+🔥 답변 예시 스타일:
+- "아 그거 진짜 기억이 잘 안 나는데"
+- "음 그런 적이 있었나"
+- "잘 모르겠어 그런 건"
+- "그런 건 별로 안 해봐서"
+- "아 그거 진짜 어려운 질문이네"
+
 질문: ${question}
 
-한 문장 답변:`;
+자연스러운 답변:`;
 
         const result = await apiLimiter.executeAPICall(
             async (contents, config) => await model.generateContent({
@@ -947,7 +1122,15 @@ async function generateMafiaPlayerResponse(question, aiName) {
         return answer;
     } catch (error) {
         console.error(`[마피아 게임] ${aiName} 답변 생성 오류:`, error);
-        return "음... 잘 기억이 안 나네요. 그런 경험이 있었던 것 같기도 하고...";
+        // 더 자연스러운 폴백 답변들
+        const naturalFallbacks = [
+            "아 그거 기억이 잘 안 나는데",
+            "음 그런 적이 있었나",
+            "잘 모르겠어 그런 건",
+            "그런 건 별로 안 해봐서",
+            "아 그거 진짜 어려운 질문이네"
+        ];
+        return naturalFallbacks[Math.floor(Math.random() * naturalFallbacks.length)];
     }
 }
 
@@ -1076,8 +1259,8 @@ async function startMafiaRound() {
             .filter(([originalName, data]) => data.isAI && originalName !== MAFIA_GAME.gameHost);
 
         aiPlayers.forEach(([originalName, data], index) => {
-            // 마피아 게임에서는 AI가 7~15초 사이에 랜덤하게 답변
-            const baseDelay = 7000 + Math.random() * 8000; // 7~15초 랜덤
+            // 마피아 게임에서는 AI가 13~23초 사이에 랜덤하게 답변
+            const baseDelay = 13000 + Math.random() * 10000; // 13~23초 랜덤
             const individualDelay = index * 1000; // AI들이 동시에 답변하지 않도록 1초씩 간격
             const totalDelay = baseDelay + individualDelay;
             
@@ -1115,6 +1298,12 @@ async function startMafiaRound() {
 
 function handleMafiaAnswer(msgObj) {
     try {
+        // 답변 시간이 아닌 경우 완전 차단
+        if (MAFIA_GAME.gamePhase !== 'answering') {
+            console.log(`[마피아 답변 차단] 답변시간이 아님: ${msgObj.from} - ${msgObj.content}`);
+            return;
+        }
+        
         const participant = MAFIA_GAME.participants.get(msgObj.from);
         if (!participant || participant.hasAnswered) {
             return; // 이미 답변했거나 참가자가 아님
@@ -2060,14 +2249,16 @@ function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
             return { user: ai, score: 0 };
         }
 
-        // === 연속 응답 방지: 같은 AI가 10초 내에 두 번 응답하지 않도록 ===
-        const recentHistory = conversationContext.getContextualHistorySnapshot().slice(-5);
-        const recentAIMessages = recentHistory.filter(m => m.from === ai.username);
-        if (recentAIMessages.length > 0) {
-            const lastAIMessage = recentAIMessages[recentAIMessages.length - 1];
-            const timeSinceLastResponse = Date.now() - new Date(lastAIMessage.timestamp).getTime();
-            if (timeSinceLastResponse < 2000) { // 2초 미만
-                console.log(`[연속 응답 방지] ${ai.username}이(가) ${Math.round(timeSinceLastResponse/1000)}초 전에 응답했으므로 제외됩니다.`);
+        // 🎯 AI 응답 타이밍 검증 (구글 수석 프로그래머 수준 최적화)
+        const isModerator = participantRoles.get(ai.username) === AI_ROLES.MODERATOR;
+        const timingCheck = canAIRespond(ai.username, isModerator);
+        
+        if (!timingCheck.canRespond) {
+            // 🎯 타이밍 검증 완화: 남은 시간이 1초 이하면 통과
+            if (timingCheck.remainingTime && timingCheck.remainingTime < 1000) {
+                console.log(`[AI 타이밍 완화] ${ai.username}: 거의 완료됨 (${Math.round(timingCheck.remainingTime)}ms 남음)`);
+            } else {
+                console.log(`[AI 타이밍 검증] ${ai.username}: ${timingCheck.reason}`);
                 return { user: ai, score: 0 };
             }
         }
@@ -2108,24 +2299,51 @@ function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
 
     const nonMentionedAIs = scoredAIs.filter(sai => sai.user.username !== mentionedAI && sai.score > 0);
     
-    // 사회자 지시가 있는 경우 더 많은 AI가 응답하도록 조정
+    // 🎯 대화 끊김 방지: 응답자 수 최적화
     const isModeratorDirective = msgObj.isModeratorDirective || false;
     const maxResponders = isModeratorDirective ? 
         Math.min(nonMentionedAIs.length, 3) : // 사회자 지시 시 최대 3명
-        Math.min(nonMentionedAIs.length, 2); // 평상시 최대 2명
+        Math.min(nonMentionedAIs.length, 2); // 평상시 최대 2명 (순차 딜레이 테스트)
     
     const scoreThreshold = isModeratorDirective ? 40 : 60; // 사회자 지시 시 참여 문턱 낮춤
 
+    // 🎯 대화 연속성 보장: 최소 1명은 항상 응답하도록 보장
+    let selectedCount = 0;
     for (let i = 0; i < maxResponders; i++) {
         const selected = nonMentionedAIs[i];
         if (selected.score > scoreThreshold && selected.user.username !== mentionedAI) {
             console.log(`[참여 결정] ${selected.user.username}`);
+            // 🎯 지능형 딜레이 계산 (구글 수석 프로그래머 수준 최적화)
+            const baseDelay = config.AI_RESPONSE_BASE_DELAY;
+            const sequentialDelay = i === 0 ? 3000 : (3000 + (i * 4000)); // 첫 번째는 3초, 그 뒤는 3+4초씩 증가
+            const randomDelay = Math.floor(Math.random() * config.AI_RESPONSE_RANDOM_DELAY);
+            const totalDelay = baseDelay + sequentialDelay + randomDelay;
+            
+            console.log(`[AI 딜레이 계산] ${selected.user.username}: 기본(${baseDelay}ms) + 순차(${sequentialDelay}ms) + 랜덤(${randomDelay}ms) = ${totalDelay}ms`);
+            
             respondingAIs.push({
                 aiName: selected.user.username,
-                delay: config.AI_RESPONSE_BASE_DELAY + (i * 1500) + Math.floor(Math.random() * config.AI_RESPONSE_RANDOM_DELAY),
+                delay: totalDelay,
                 targetName: msgObj.from
             });
+            selectedCount++;
         }
+    }
+    
+    // 🎯 대화 연속성 보장: 아무도 선택되지 않았다면 최고 점수 AI 강제 선택
+    if (selectedCount === 0 && nonMentionedAIs.length > 0) {
+        const bestAI = nonMentionedAIs[0];
+        console.log(`[대화 연속성 보장] ${bestAI.user.username}을(를) 강제 선택 (점수: ${bestAI.score})`);
+        
+        const baseDelay = config.AI_RESPONSE_BASE_DELAY;
+        const randomDelay = Math.floor(Math.random() * config.AI_RESPONSE_RANDOM_DELAY);
+        const totalDelay = baseDelay + randomDelay;
+        
+        respondingAIs.push({
+            aiName: bestAI.user.username,
+            delay: totalDelay,
+            targetName: msgObj.from
+        });
     }
     
     // 턴 카운터 증가 (사회자가 개입하지 않은 경우)
@@ -2133,11 +2351,113 @@ function selectRespondingAIs(candidateAIs, msgObj, mentionedAI) {
         moderatorTurnCount++;
     }
     
+    // 🎯 AI 대화 상태 로깅 (디버깅)
+    if (respondingAIs.length > 0) {
+        console.log(`[AI 응답 예정] ${respondingAIs.length}명의 AI가 응답할 예정입니다:`);
+        respondingAIs.forEach((ai, index) => {
+            console.log(`  ${index + 1}. ${ai.aiName} (${ai.delay}ms 후)`);
+        });
+        logAIConversationStatus();
+    } else {
+        console.log('[AI 응답] 현재 응답할 AI가 없습니다.');
+        logAIConversationStatus();
+    }
+    
     return respondingAIs;
 }
 
 function markMentionAsAnswered(messageId, aiName) {
     console.log(`[멘션 처리] ${aiName}이(가) 메시지 ${messageId}에 응답했습니다.`);
+}
+
+// 🎯 AI 응답 타이밍 검증 함수들
+function canAIRespond(aiName, isModerator = false) {
+    const now = Date.now();
+    
+    // 진행자 AI는 제외 (항상 응답 가능)
+    if (isModerator && AI_RESPONSE_TIMING.MODERATOR_EXEMPT) {
+        return { canRespond: true, reason: '진행자 AI는 제외' };
+    }
+    
+    // AI 간 최소 응답 간격 확인 (구글 수석 프로그래머 수준 수정)
+    const lastResponseTime = aiLastResponseTime.get(aiName) || 0;
+    const timeSinceLastResponse = now - lastResponseTime;
+    
+    if (timeSinceLastResponse < AI_RESPONSE_TIMING.MIN_INTERVAL) {
+        return { 
+            canRespond: false, 
+            reason: `AI 간 최소 간격 미충족 (${Math.round(timeSinceLastResponse/1000)}초 경과, 필요: ${AI_RESPONSE_TIMING.MIN_INTERVAL/1000}초)`,
+            remainingTime: AI_RESPONSE_TIMING.MIN_INTERVAL - timeSinceLastResponse
+        };
+    }
+    
+    // 같은 AI 재응답 쿨다운 확인
+    const lastSpeakTime = aiLastSpeakTime.get(aiName) || 0;
+    const timeSinceLastSpeak = now - lastSpeakTime;
+    
+    if (timeSinceLastSpeak < AI_RESPONSE_TIMING.AI_COOLDOWN) {
+        return { 
+            canRespond: false, 
+            reason: `AI 재응답 쿨다운 미충족 (${Math.round(timeSinceLastSpeak/1000)}초 경과, 필요: ${AI_RESPONSE_TIMING.AI_COOLDOWN/1000}초)`,
+            remainingTime: AI_RESPONSE_TIMING.AI_COOLDOWN - timeSinceLastSpeak
+        };
+    }
+    
+    return { canRespond: true, reason: '모든 조건 충족' };
+}
+
+function updateAIResponseTime(aiName) {
+    const now = Date.now();
+    aiLastResponseTime.set(aiName, now);
+    aiLastSpeakTime.set(aiName, now);
+    console.log(`[AI 타이밍] ${aiName} 응답 시간 업데이트: ${new Date(now).toLocaleTimeString()}`);
+}
+
+// 🎯 AI 대화 연속성 모니터링 시스템
+function getAIConversationStats() {
+    const now = Date.now();
+    const stats = {
+        totalAIs: Array.from(users.values()).filter(u => u.isAI).length,
+        activeAIs: 0,
+        cooldownAIs: 0,
+        readyAIs: 0,
+        details: []
+    };
+    
+    Array.from(users.values()).filter(u => u.isAI).forEach(ai => {
+        const isModerator = participantRoles.get(ai.username) === AI_ROLES.MODERATOR;
+        const timingCheck = canAIRespond(ai.username, isModerator);
+        
+        if (timingCheck.canRespond) {
+            stats.readyAIs++;
+        } else {
+            stats.cooldownAIs++;
+        }
+        
+        stats.details.push({
+            aiName: ai.username,
+            isModerator,
+            canRespond: timingCheck.canRespond,
+            reason: timingCheck.reason,
+            lastResponse: aiLastResponseTime.get(ai.username) || 0,
+            lastSpeak: aiLastSpeakTime.get(ai.username) || 0
+        });
+    });
+    
+    return stats;
+}
+
+// 🎯 AI 대화 상태 로깅 (디버깅용)
+function logAIConversationStatus() {
+    const stats = getAIConversationStats();
+    console.log(`[AI 대화 상태] 총 AI: ${stats.totalAIs}, 응답 가능: ${stats.readyAIs}, 쿨다운: ${stats.cooldownAIs}`);
+    
+    if (stats.cooldownAIs > 0) {
+        console.log('[AI 쿨다운 상세]');
+        stats.details.filter(d => !d.canRespond).forEach(d => {
+            console.log(`  - ${d.aiName}: ${d.reason}`);
+        });
+    }
 }
 
 async function scheduleAIResponses(respondingAIs, msgObj, historySnapshot) {
@@ -2165,6 +2485,9 @@ async function scheduleAIResponses(respondingAIs, msgObj, historySnapshot) {
                     };
                     
                     logMessage(aiMsgObj);
+
+                    // 🎯 AI 응답 시간 업데이트 (타이밍 관리)
+                    updateAIResponseTime(aiName);
 
                     if (msgObj.id && !isModerator) {
                         markMentionAsAnswered(msgObj.id, aiName);
@@ -2284,7 +2607,30 @@ async function handleMeetingMinutes(initiatingMsgObj) {
 (논의를 통해 최종적으로 합의되거나 결정된 사항들을 명확하게 조목별로 기입. 결정된 내용이 없다면 "해당 없음"으로 기재)
 
 #### 실행 항목 (Action Items)
-(결정 사항에 따라 발생한 후속 조치 사항을 기입. "담당자", "업무 내용", "기한"을 명시하여 표 형식 또는 리스트로 정리. 실행 항목이 없다면 "해당 없음"으로 기재)
+(결정 사항에 따라 발생한 후속 조치 사항을 기입. "담당자", "업무 내용", "기한"을 명시하여 <table> 태그를 사용한 HTML 표 형식으로 정리. 실행 항목이 없다면 "해당 없음"으로 기재. 반드시 아래 예시처럼 <table> 태그를 사용하여 출력할 것.)
+
+<!-- 예시: 실행 항목 표 (반드시 <table> 태그 사용) -->
+<table>
+  <thead>
+    <tr>
+      <th>순번</th>
+      <th>실행 내용</th>
+      <th>담당자</th>
+      <th>완료 기한</th>
+      <th>우선순위</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1</td>
+      <td>정보원, 교란자 역할 카드 세부 규칙 및 튜토리얼 초안 작성</td>
+      <td>AI3</td>
+      <td>2025. 7. 8.</td>
+      <td>높음</td>
+    </tr>
+    <!-- ... -->
+  </tbody>
+</table>
 
 ---
 
@@ -2474,6 +2820,18 @@ async function processConversationTurn(turn) {
     }
     const { stimulus } = turn;
 
+    // 🛡️ 무한 루프 방지: 이미 처리된 메시지인지 확인
+    if (processedMessageIds.has(stimulus.id)) {
+        console.log(`[무한 루프 방지] 이미 처리된 메시지 건너뜀: ${stimulus.id} - ${stimulus.content.substring(0, 30)}...`);
+        isProcessingTurn = false;
+        processTurnQueue();
+        return;
+    }
+
+    // 처리된 메시지 ID 추가
+    processedMessageIds.add(stimulus.id);
+    console.log(`[메시지 처리] ${stimulus.id} - ${stimulus.content.substring(0, 30)}... (처리됨 표시: ${processedMessageIds.size}개)`);
+
     isProcessingTurn = true;
 
     try {
@@ -2538,6 +2896,13 @@ function addToTurnQueue(msgObj, isHighPriority = false) {
         }
     }
 
+    // 🛡️ 중복 메시지 큐 추가 방지
+    const existsInQueue = turnQueue.some(turn => turn.stimulus && turn.stimulus.id === msgObj.id);
+    if (existsInQueue) {
+        console.log(`[중복 방지] 이미 큐에 있는 메시지 건너뜀: ${msgObj.id} - ${msgObj.content.substring(0, 30)}...`);
+        return;
+    }
+
     if (isHighPriority) {
         const highPriorityTurns = turnQueue.filter(turn => turn.isHighPriority);
         turnQueue.length = 0;
@@ -2553,6 +2918,13 @@ function addToTurnQueue(msgObj, isHighPriority = false) {
 
 async function processTurnQueue() {
     if (isProcessingTurn || turnQueue.length === 0 || isConversationPausedForMeetingNotes) return;
+    
+    // 🛡️ 추가 안전장치: 큐 크기 제한 (무한 누적 방지)
+    if (turnQueue.length > 50) {
+        console.warn(`[큐 오버플로우 방지] 턴 큐가 ${turnQueue.length}개로 과도하게 누적됨. 절반 정리.`);
+        turnQueue.splice(0, Math.floor(turnQueue.length / 2));
+    }
+    
     const nextTurn = turnQueue.shift();
     await processConversationTurn(nextTurn);
 }
@@ -4404,7 +4776,52 @@ function normalizeTableData(rawData) {
     
     return [];
 }
-
+// ... existing code ...
+// HTML <table>을 docx.Table로 변환하는 함수 (generateWordContent보다 위에 위치해야 함)
+function htmlTableToDocxTable(html) {
+    const $ = cheerio.load(html);
+    const table = $('table').first();
+    if (!table.length) return null;
+    const rows = [];
+    let maxCells = 0;
+    // 1. 모든 행의 셀 개수 파악
+    table.find('tr').each((i, tr) => {
+        const cellCount = $(tr).find('th,td').length;
+        if (cellCount > maxCells) maxCells = cellCount;
+    });
+    // 2. 행 생성 (셀 개수 맞추기)
+    table.find('tr').each((i, tr) => {
+        const cells = [];
+        $(tr).find('th,td').each((j, td) => {
+            const text = $(td).text().trim();
+            cells.push(new TableCell({
+                children: [new Paragraph({ text })],
+                width: { size: 20, type: WidthType.PERCENTAGE }
+            }));
+        });
+        // 부족한 셀은 빈 셀로 패딩
+        while (cells.length < maxCells) {
+            cells.push(new TableCell({
+                children: [new Paragraph({ text: "" })],
+                width: { size: 20, type: WidthType.PERCENTAGE }
+            }));
+        }
+        rows.push(new TableRow({ children: cells }));
+    });
+    return new Table({
+        rows,
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        borders: {
+            top: { style: 'single', size: 1, color: 'bdbdbd' },
+            bottom: { style: 'single', size: 1, color: 'bdbdbd' },
+            left: { style: 'single', size: 1, color: 'bdbdbd' },
+            right: { style: 'single', size: 1, color: 'bdbdbd' },
+            insideH: { style: 'single', size: 1, color: 'bdbdbd' },
+            insideV: { style: 'single', size: 1, color: 'bdbdbd' }
+        }
+    });
+}
+// ... existing code ...
 // ===================================================================================
 // Express 라우트 설정
 // ===================================================================================
@@ -4570,8 +4987,6 @@ function cleanMarkdownForHeading(text) {
         .replace(/\**(배경)\**/g, '배경')             // 배경 주변 * 모두 제거
         .replace(/\**(내용)\**/g, '내용')             // 내용 주변 * 모두 제거
         .replace(/\**(결과)\**/g, '결과')             // 결과 주변 * 모두 제거
-        .replace(/\**(\w+)\**(?=\s*[:：])/g, '$1')    // 단어: 주변 * 모두 제거
-        .replace(/\**(\w+)\**(?=\s*$)/g, '$1')       // 문장 끝 단어 주변 * 모두 제거
         .replace(/\*\*\*(.+?)\*\*\*/g, '$1')         // ***text*** → text
         .replace(/\*\*(.+?)\*\*/g, '$1')             // **text** → text
         .replace(/\*(.+?)\*/g, '$1')                 // *text* → text
@@ -4594,8 +5009,13 @@ function parseMarkdownToWordRuns(text) {
         .replace(/\**(배경)\**/g, '배경')             // 배경 주변 * 모두 제거
         .replace(/\**(내용)\**/g, '내용')             // 내용 주변 * 모두 제거
         .replace(/\**(결과)\**/g, '결과')             // 결과 주변 * 모두 제거
-        .replace(/\**(\w+)\**(?=\s*[:：])/g, '$1')    // 단어: 주변 * 모두 제거
-        .replace(/\**(\w+)\**(?=\s*$)/g, '$1');      // 문장 끝 단어 주변 * 모두 제거
+        .replace(/\*\*\*(.+?)\*\*\*/g, '$1')         // ***text*** → text
+        .replace(/\*\*(.+?)\*\*/g, '$1')             // **text** → text
+        .replace(/\*(.+?)\*/g, '$1')                 // *text* → text
+        .replace(/`(.+?)`/g, '$1')                   // `text` → text
+        .replace(/~~(.+?)~~/g, '$1')                 // ~~text~~ → text
+        .replace(/\*+$/g, '')                        // 끝에 붙은 * 제거
+        .trim();
     
     // 마크다운 패턴들 (우선순위 순서로 정렬 - 헤딩 추가)
     const patterns = [
@@ -4697,16 +5117,14 @@ function parseMarkdownToWordRuns(text) {
 // Word 문서 내용 생성
 function generateWordContent(parsedData) {
     const children = [];
-    
-    // 제목 추가 (마크다운 제거)
+    // 제목
     children.push(new Paragraph({
         text: cleanMarkdownForHeading(parsedData.title),
         heading: HeadingLevel.TITLE,
         alignment: AlignmentType.CENTER,
         spacing: { after: 280 }
     }));
-    
-    // 생성 정보 추가
+    // 생성 정보
     children.push(new Paragraph({
         children: [
             new TextRun({
@@ -4719,81 +5137,114 @@ function generateWordContent(parsedData) {
         alignment: AlignmentType.RIGHT,
         spacing: { after: 200 }
     }));
-    
-    // 구분선 (적절한 길이로 조정)
+    // 구분선
     children.push(new Paragraph({
         text: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         alignment: AlignmentType.CENTER,
         spacing: { after: 200 }
     }));
-    
-    // 내용 추가
-    for (const item of parsedData.content) {
-        switch (item.type) {
-            case 'heading1':
-                children.push(new Paragraph({
-                    text: cleanMarkdownForHeading(item.text),
-                    heading: HeadingLevel.HEADING_1,
-                    spacing: { before: 200, after: 100 }
-                }));
-                
-                // 서브 콘텐츠 추가
-                for (const subItem of item.content || []) {
-                    children.push(...generateContentParagraph(subItem));
+    // 본문 처리
+    for (const section of parsedData.content) {
+        // 표: <table>이 포함된 텍스트는 텍스트로 추가하지 않고 표로만 변환
+        if (section.type === 'paragraph' && section.text.includes('<table')) {
+            const docxTable = htmlTableToDocxTable(section.text);
+            if (docxTable) {
+                children.push(docxTable);
+                continue;
+            }
+        }
+        // 헤딩1
+        if (section.type === 'heading1') {
+            children.push(new Paragraph({
+                text: cleanMarkdownForHeading(section.text),
+                heading: HeadingLevel.HEADING_1,
+                alignment: AlignmentType.CENTER,
+                spacing: { before: 200, after: 100 }
+            }));
+            if (section.content) {
+                for (const sub of section.content) {
+                    if (sub.type === 'paragraph' && sub.text.includes('<table')) {
+                        const docxTable = htmlTableToDocxTable(sub.text);
+                        if (docxTable) {
+                            children.push(docxTable);
+                            continue;
+                        }
+                    }
+                    if (sub.type === 'paragraph') {
+                        children.push(new Paragraph({
+                            children: parseMarkdownToWordRuns(sub.text),
+                            spacing: { after: 80 }
+                        }));
+                    } else if (sub.type === 'listItem') {
+                        children.push(new Paragraph({
+                            children: parseMarkdownToWordRuns(sub.text),
+                            bullet: { level: 0 },
+                            spacing: { after: 60 }
+                        }));
+                    } else if (sub.type === 'heading2') {
+                        children.push(new Paragraph({
+                            text: cleanMarkdownForHeading(sub.text),
+                            heading: HeadingLevel.HEADING_2,
+                            alignment: AlignmentType.LEFT,
+                            spacing: { before: 160, after: 80 }
+                        }));
+                    }
                 }
-                break;
-                
-            case 'heading2':
-                children.push(new Paragraph({
-                    text: cleanMarkdownForHeading(item.text),
-                    heading: HeadingLevel.HEADING_2,
-                    spacing: { before: 160, after: 80 }
-                }));
-                
-                // 서브 콘텐츠 추가
-                for (const subItem of item.content || []) {
-                    children.push(...generateContentParagraph(subItem));
+            }
+            continue;
+        }
+        // 헤딩2
+        if (section.type === 'heading2') {
+            children.push(new Paragraph({
+                text: cleanMarkdownForHeading(section.text),
+                heading: HeadingLevel.HEADING_2,
+                alignment: AlignmentType.LEFT,
+                spacing: { before: 160, after: 80 }
+            }));
+            if (section.content) {
+                for (const sub of section.content) {
+                    if (sub.type === 'paragraph' && sub.text.includes('<table')) {
+                        const docxTable = htmlTableToDocxTable(sub.text);
+                        if (docxTable) {
+                            children.push(docxTable);
+                            continue;
+                        }
+                    }
+                    if (sub.type === 'paragraph') {
+                        children.push(new Paragraph({
+                            children: parseMarkdownToWordRuns(sub.text),
+                            spacing: { after: 80 }
+                        }));
+                    } else if (sub.type === 'listItem') {
+                        children.push(new Paragraph({
+                            children: parseMarkdownToWordRuns(sub.text),
+                            bullet: { level: 0 },
+                            spacing: { after: 60 }
+                        }));
+                    }
                 }
-                break;
-                
-            default:
-                children.push(...generateContentParagraph(item));
+            }
+            continue;
+        }
+        // 리스트
+        if (section.type === 'listItem') {
+            children.push(new Paragraph({
+                children: parseMarkdownToWordRuns(section.text),
+                bullet: { level: 0 },
+                spacing: { after: 60 }
+            }));
+            continue;
+        }
+        // 일반 단락
+        if (section.type === 'paragraph') {
+            children.push(new Paragraph({
+                children: parseMarkdownToWordRuns(section.text),
+                spacing: { after: 80 }
+            }));
+            continue;
         }
     }
-    
     return children;
-}
-
-// 개별 컨텐츠 항목을 문단으로 변환
-function generateContentParagraph(item) {
-    switch (item.type) {
-        case 'listItem':
-            // 리스트 아이템에서 마크다운 처리
-            const listText = `• ${item.text}`;
-            const listRuns = parseMarkdownToWordRuns(listText);
-            return [new Paragraph({
-                children: listRuns,
-                indent: { left: 400 },
-                spacing: { after: 60 }
-            })];
-            
-        case 'paragraph':
-            // 일반 단락에서 마크다운 처리
-            const paragraphRuns = parseMarkdownToWordRuns(item.text);
-            return [new Paragraph({
-                children: paragraphRuns,
-                spacing: { after: 80 }
-            })];
-            
-        default:
-            // 기타 타입에서도 마크다운 처리
-            const text = item.text || String(item);
-            const defaultRuns = parseMarkdownToWordRuns(text);
-            return [new Paragraph({
-                children: defaultRuns,
-                spacing: { after: 80 }
-            })];
-    }
 }
 
 // 간단한 Word 문서 생성 (파싱 실패 시 폴백)
@@ -5033,6 +5484,13 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
         // 마피아 게임 중인 경우 답변 처리
         if (MAFIA_GAME.isActive && MAFIA_GAME.gamePhase === 'answering') {
             handleMafiaAnswer(msgObj);
+            return;
+        }
+        
+        // 마피아 게임 중이지만 답변시간이 아닌 경우 메시지 차단 (채팅창에 표시 안함)
+        if (MAFIA_GAME.isActive && MAFIA_GAME.gamePhase !== 'answering') {
+            // 답변시간 종료 후 입력된 메시지는 무시 (채팅창에 표시되지 않음)
+            console.log(`[마피아 게임] 답변시간 종료 후 메시지 차단: ${msgObj.from} - ${msgObj.content}`);
             return;
         }
         
@@ -5425,6 +5883,34 @@ io.on(SOCKET_EVENTS.CONNECTION, (socket) => {
         }
     });
 });
+
+// ===================================================================================
+// 🛡️ 무한 루프 방지: 메시지 ID 정리 시스템 (메모리 누수 방지)
+// ===================================================================================
+setInterval(() => {
+    const beforeSize = processedMessageIds.size;
+    processedMessageIds.clear(); // 10분마다 모든 ID 정리 (간단한 방식)
+    console.log(`[메시지 ID 정리] ${beforeSize}개 → 0개 (메모리 정리 완료)`);
+}, MESSAGE_ID_CLEANUP_INTERVAL);
+
+// 🎯 AI 타이밍 데이터 정리 (메모리 관리)
+setInterval(() => {
+    const now = Date.now();
+    const cutoffTime = now - (30 * 60 * 1000); // 30분 전
+    
+    let cleanedCount = 0;
+    for (const [aiName, lastResponseTime] of aiLastResponseTime.entries()) {
+        if (lastResponseTime < cutoffTime) {
+            aiLastResponseTime.delete(aiName);
+            aiLastSpeakTime.delete(aiName);
+            cleanedCount++;
+        }
+    }
+    
+    if (cleanedCount > 0) {
+        console.log(`[AI 타이밍 정리] ${cleanedCount}개 AI 타이밍 데이터 정리 완료`);
+    }
+}, 30 * 60 * 1000); // 30분마다 실행
 
 // ===================================================================================
 // 서버 시작
